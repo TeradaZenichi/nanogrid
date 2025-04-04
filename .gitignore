@@ -1,4 +1,4 @@
-data/
+.forget/
 .venv/
 venv/
 __pycache__/
