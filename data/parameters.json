@@ -1,9 +1,10 @@
 {
   "time": {
-    "horizon_hours": 24,
+    "horizon_hours": 36,
     "fine_hours": 1,
+    "timestep": 5,
     "timestep_1_min": 5,
-    "timestep_2_min": 30
+    "timestep_2_min": 60
   },
   "costs": {
     "c_shed_per_kwh": 1000.0,
@@ -19,28 +20,31 @@
   },
   "EDS": {
     "Pmax_kw": 25.0,
-    "outage_probability_pct": 10,
+    "outage_probability_pct": 0,
+    "outage_duration_hours": 1,
     "Pmax": 5,
     "Pmin": 1
   },
   "BESS": {
-    "Pmax_kw": 5.0,
-    "Emax_kwh": 10.0,
+    "Pmax_kw": 2.0,
+    "Emax_kwh": 4.0,
     "DoD_frac": 0.90,
     "eta_c": 0.95,
     "eta_d": 0.95,
     "ramp_kw_per_step": 1.0,
-    "E_init_kwh": 5.0,
+    "E_init_kwh": 2.0,
     "noisy": true,
     "noise": {
-    "type": "gauss",
-    "std_frac": 0.05,   
-    "std_kw": 0.0,      
-    "seed": 123     
-  }
+      "type": "gauss",
+      "std_frac": 0.05,   
+      "std_kw": 0.0,      
+      "seed": 123     
+   },
+  "replacement_cost_per_kwh": 250,   
+  "cycle_life_full": 4000           
   },
   "PV": {
-    "Pmax_kw": 3.0
+    "Pmax_kw": 2.5
   },
   "Load": {
     "Pmax_kw": 5.0

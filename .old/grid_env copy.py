@@ -99,6 +99,21 @@ class GridEnv:
 
         self.reset()
     
+    # def _align_start(self, start_dt0: pd.Timestamp) -> pd.Timestamp:
+    #     ts = pd.Timestamp(start_dt0)
+    #     idx = self.common_index
+    #     if ts in idx:
+    #         return ts
+    #     # Próximo timestamp disponível (ceil)
+    #     pos = idx.searchsorted(ts, side="left")
+    #     if pos >= len(idx):
+    #         aligned = pd.Timestamp(idx[-1])
+    #         self._log(f"start {ts} beyond data — aligned to last available {aligned}")
+    #         return aligned
+    #     aligned = pd.Timestamp(idx[pos])
+    #     self._log(f"start {ts} not in data — aligned to next available {aligned}")
+    #     return aligned
+
 
 
     def _parse_constraints_and_costs(self):
@@ -297,14 +312,18 @@ class GridEnv:
 
         # ------------------- ON-GRID ACTIONS ---------------------
         else:  # "ongrid"
-            
+            # Outage: nem importa nem exporta
+            outage = (random.random() < self.grid_caps["outage_prob"]) if self.grid_caps["outage_prob"] > 0 else False
+            cap_imp = 0.0 if outage else max(0.0, self.grid_caps["P_import_max"])
+            cap_exp = 0.0 if outage else max(0.0, self.grid_caps["P_export_max"])
+
             # 1) Déficit -> importar primeiro (até o cap)
             if residual > self.tol_kw:
-                take = min(residual, self.grid_caps["P_import_max"])
+                take = min(residual, cap_imp)
                 if take > 0:
                     Pgrid_in += take
                     residual -= take
-                    clamps["grid_import"] = {"kW": take, "outage": False}
+                    clamps["grid_import"] = {"kW": take, "outage": outage}
 
             # 2) Se ainda houver déficit -> shedding
             if residual > self.tol_kw:
@@ -321,11 +340,11 @@ class GridEnv:
             # 3) Superávit -> exportar antes de curtail
             if residual < -self.tol_kw:
                 surplus = -residual
-                take = min(surplus, self.grid_caps["P_export_max"])
+                take = min(surplus, cap_exp)
                 if take > 0:
                     Pgrid_out += take
                     residual  += take
-                    clamps["grid_export"] = {"kW": take, "outage": False}
+                    clamps["grid_export"] = {"kW": take, "outage": outage}
 
             # 4) Se ainda sobrar superávit -> curtail PV
             if residual < -self.tol_kw:
@@ -391,6 +410,10 @@ class GridEnv:
         self._prev_Pb = Pb_eff
         self.timestamp = self.timestamp + pd.Timedelta(minutes=self.dt_h * 60)
         self.iter_k += 1
+
+        # clear active window
+        # self._last_times = None
+        # self._last_forecasts = None
 
         # debug
         self._log(
