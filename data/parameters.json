@@ -1,7 +1,6 @@
 {
   "time": {
     "horizon_hours": 36,
-    "fine_hours": 1,
     "timestep": 5,
     "timestep_1_min": 5,
     "timestep_2_min": 60
@@ -19,20 +18,20 @@
     }
   },
   "EDS": {
-    "Pmax_kw": 25.0,
-    "outage_probability_pct": 0,
-    "outage_duration_hours": 1,
+    "outage_probability_pct": 25,
+    "outage_duration_std_dev_frac": 0.3,
+    "outage_duration_hours": 2,
     "Pmax": 5,
     "Pmin": 1
   },
   "BESS": {
-    "Pmax_kw": 2.0,
-    "Emax_kwh": 4.0,
+    "Pmax_kw": 2.5,
+    "Emax_kwh": 5.0,
     "DoD_frac": 0.90,
     "eta_c": 0.95,
     "eta_d": 0.95,
     "ramp_kw_per_step": 1.0,
-    "E_init_kwh": 2.0,
+    "E_init_kwh": 2.5,
     "noisy": true,
     "noise": {
       "type": "gauss",
