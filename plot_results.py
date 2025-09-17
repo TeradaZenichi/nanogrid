@@ -367,7 +367,7 @@ if __name__ == "__main__":
     TARGET_DATETIME = "2009-05-01 04:15:00"
     MPC_SOLUTIONS_DIR = "outputs/mpc_solutions"
 
-    generate_plots_for_timestamp(TARGET_DATETIME, MPC_SOLUTIONS_DIR)
+    # generate_plots_for_timestamp(TARGET_DATETIME, MPC_SOLUTIONS_DIR)
     # create_mpc_evolution_3d_plots(MPC_SOLUTIONS_DIR, OUTPUT_DIR)
 
     FROM = pd.Timestamp("2009-05-01 00:00:00")
