@@ -18,10 +18,10 @@
     }
   },
   "EDS": {
-    "outage_probability_pct": 25,
-    "outage_duration_std_dev_frac": 0.3,
+    "outage_probability_pct": 50,
+    "outage_duration_std_dev_frac": 1.0,
     "outage_duration_hours": 2,
-    "Pmax": 5,
+    "Pmax": 2,
     "Pmin": 1
   },
   "BESS": {
@@ -30,16 +30,16 @@
     "DoD_frac": 0.90,
     "eta_c": 0.95,
     "eta_d": 0.95,
-    "ramp_kw_per_step": 1.0,
-    "E_init_kwh": 2.5,
-    "noisy": true,
+    "ramp_kw_per_step": 2.5,
+    "E_init_kwh": 5.0,
+    "noisy": false,
     "noise": {
       "type": "gauss",
       "std_frac": 0.05,   
       "std_kw": 0.0,      
       "seed": 123     
    },
-  "replacement_cost_per_kwh": 250,   
+  "replacement_cost_per_kwh": 1250,   
   "cycle_life_full": 4000           
   },
   "PV": {

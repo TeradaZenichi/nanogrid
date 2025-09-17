@@ -7,7 +7,7 @@ from opt.utils import build_dt_vector, load_series_scaled
 
 
 def _get_nested(d: Dict[str, Any], path_list: List[str], default: Any = None):
-    """Accesses a value from a JSON based on a provided path, keeping the original structure."""
+    """Access a value from nested dict-like JSON using alternative dot-paths; keeps original structure."""
     for path in path_list:
         cur = d
         ok = True
@@ -21,8 +21,9 @@ def _get_nested(d: Dict[str, Any], path_list: List[str], default: Any = None):
             return cur
     return default
 
+
 def _resolve_dt_vector(params: Dict[str, Any]) -> List[float]:
-    """Resolves the timestep vector based on the original (unflattened) JSON."""
+    """Resolve timestep vector based on the original (unflattened) JSON."""
     for key in ["dt_vector", "dt_minutes", "dt_min_vector", "dt_min_list"]:
         if key in params and isinstance(params[key], (list, tuple)):
             vec = params[key]
@@ -41,14 +42,17 @@ def _resolve_dt_vector(params: Dict[str, Any]) -> List[float]:
 
     return build_dt_vector(h, Hod, dt1, dt2)
 
+
 def _hour_key(ts: pd.Timestamp) -> str:
     return f"{int(ts.hour):02d}:00"
+
 
 def _safe_div(a: float, b: float, eps: float = 1e-9) -> float:
     return a / b if abs(b) > eps else 0.0
 
+
 def _derive_scaling_params(params: Dict[str, Any]) -> Dict[str, float]:
-    """Extracts Load and PV Pmax directly from the JSON (unflattened)."""
+    """Extract Load and PV Pmax directly from JSON (unflattened)."""
     P_L_max = _get_nested(params, [
         "P_L_nom_kw", "Load.Pmax_kw", "Load.Pmax", "load.Pmax_kw", "load.Pmax"
     ], None)
@@ -82,34 +86,44 @@ class GridEnv:
         self.debug = debug
         self.clamp_soc_pct = clamp_soc_pct
         self.tol_kw = tol_kw
+
+        # Base timestep in hours for state update (dt_h); TOU resolution also uses hour-key
         self.dt_h = self.p.get("time", {}).get("timestep", 5) / 60.0
+
+        # Outage probability per step
         outage_prob_daily = self.p.get("EDS", {}).get("outage_probability_pct", 0.0) / 100.0
         timestep_min = self.dt_h * 60
         self.outage_prob_per_step = outage_prob_daily * (timestep_min / (24 * 60))
+
         self.start_dt0 = pd.Timestamp(start_dt0)
 
-        # --- NEW CONTINGENCY LOGIC ---
+        # --- Contingency (outage) duration statistics ---
         EDS = self.p.get("EDS", {})
         self.mean_outage_duration_h = float(EDS.get("outage_duration_hours", 4.0)) / 2.0
         std_dev_frac = float(EDS.get("outage_duration_std_dev_frac", 0.3))
         self.std_dev_outage_duration_h = self.mean_outage_duration_h * std_dev_frac
-        
+
         self.outage_active = False
         self.outage_end_time = None
         self.outage_triggered_today = False
         self.current_day = None
-        # --- END OF NEW LOGIC ---
+        # --- End contingency fields ---
 
+        # Series scaling and time vector
         scaling = _derive_scaling_params(self.p)
         self.load_kw_s, self.pv_kw_s = load_series_scaled(scaling, self.load_csv, self.pv_csv)
-
         self.dt_min = _resolve_dt_vector(self.p)
+
+        # Parse constraints and costs
         self._parse_constraints_and_costs()
+
+        # Storage for logs
         self._rows: List[Dict[str, Any]] = []
 
         self.reset()
 
     def _parse_constraints_and_costs(self):
+        """Parse BESS, grid caps, noise, RNGs, and costs from params."""
         B = self.p.get("BESS", {})
         E_nom = float(B.get("Emax_kwh", self.p.get("E_nom_kwh", 0.0)) or 0.0)
         E_nom = max(E_nom, 1e-9)
@@ -144,6 +158,7 @@ class GridEnv:
             "std_kw": float(noise_dict.get("std_kw", 0.0)),
             "seed": noise_dict.get("seed", None),
         }
+        # RNGs: one for actuator noise, one for outage sampling
         self._rng = random.Random(self.noise["seed"]) if self.noise["enabled"] and self.noise["seed"] is not None else random
         self._rng_outage = random.Random(self.noise["seed"]) if self.noise["seed"] is not None else random
 
@@ -160,7 +175,7 @@ class GridEnv:
             "P_import_max": max(0.0, P_import_max),
             "P_export_max": max(0.0, P_export_max),
         }
-        
+
         C = self.p.get("costs", {})
         self.costs = {
             "c_shed": float(C.get("c_shed_per_kwh", 0.0)),
@@ -173,23 +188,25 @@ class GridEnv:
             print(f"[GridEnv] {msg}")
 
     def reset(self):
+        """Reset environment state for a fresh run."""
         self.iter_k = 0
         self.timestamp = self.start_dt0
+
+        # Initial energy (E0)
         if self.bess["E_init"] is not None:
             E0 = float(self.bess["E_init"])
         else:
             E0 = self.bess["E_nom"] * max(self.bess["soc_min"], 0.5)
         self.E_meas = min(max(E0, self.bess["E_min"]), self.bess["E_max"])
         self._prev_Pb = 0.0
-        
-        # --- RESET CONTINGENCY FLAGS ---
+
+        # Reset contingency flags
         self.outage_active = False
         self.outage_end_time = None
         self.current_day = self.start_dt0.date()
         self.outage_triggered_today = False
-        self.mode = "ongrid" # Always start in on-grid mode
-        # --- END OF RESET ---
-        
+        self.mode = "ongrid"  # Always start on-grid
+
         self._log(
             "reset: start=%s, E=%.3f kWh (E_min=%.3f, E_max=%.3f, Pmax=%s, ramp=%s)"
             % (self.start_dt0, self.E_meas, self.bess["E_min"], self.bess["E_max"],
@@ -198,7 +215,7 @@ class GridEnv:
         )
 
     def _update_outage_status(self):
-        """New method to manage the contingency state at each step."""
+        """Update the contingency state at each step tail; sets mode for the next step."""
         if self.timestamp.date() > self.current_day:
             self._log(f"New day detected ({self.timestamp.date()}). Resetting daily outage flag.")
             self.current_day = self.timestamp.date()
@@ -219,10 +236,9 @@ class GridEnv:
                 self.outage_active = True
                 self.outage_triggered_today = True
                 self.mode = "offgrid"
-                
+
                 duration_h = self._rng_outage.gauss(self.mean_outage_duration_h, self.std_dev_outage_duration_h)
-                duration_h = max(self.dt_h, duration_h) # Must last at least one timestep
-                
+                duration_h = max(self.dt_h, duration_h)  # at least one timestep
                 self.outage_end_time = self.timestamp + pd.Timedelta(hours=duration_h)
                 self._log(f"--- OUTAGE TRIGGERED at {self.timestamp} ---")
                 self._log(f"Duration: {duration_h:.2f} hours. Expected end time: {self.outage_end_time}.")
@@ -230,7 +246,7 @@ class GridEnv:
                 self.mode = "ongrid"
         else:
             self.mode = "ongrid"
-            
+
     def done(self) -> bool:
         return self.iter_k >= self.n_iters
 
@@ -242,26 +258,95 @@ class GridEnv:
         obj: Optional[float] = None,
         exec_time_sec: Optional[float] = None
     ) -> Tuple[Dict[str, Any], bool]:
-        
-        # A chamada para _update_outage_status foi removida do início.
-        # A lógica agora prossegue usando o 'self.mode' que foi determinado no final do passo anterior.
-
+        """
+        One simulation step:
+        - Off-grid: force BESS command to equal the exact deficit/surplus Δ = Load - PV,
+          limited by ramp, Pmax, and energy caps. Noise is NOT applied in off-grid.
+        - On-grid: keep external command path (noise may be applied).
+        """
+        # Current exogenous inputs
         load0 = self.load_kw_s.get(self.timestamp, 0.0)
         pv0   = self.pv_kw_s.get(self.timestamp, 0.0)
-        
-        XL_cmd = 0.0 if X_L is None else float(X_L)
+
+        # Incoming commands (clamped but may be overridden in off-grid)
+        XL_cmd  = 0.0 if X_L  is None else float(X_L)
         XPV_cmd = 0.0 if X_PV is None else float(X_PV)
-        XL = min(max(XL_cmd, 0.0), 1.0)
+        XL  = min(max(XL_cmd,  0.0), 1.0)
         XPV = min(max(XPV_cmd, 0.0), 1.0)
+
         clamps: Dict[str, Any] = {}
         if XL != XL_cmd or XPV != XPV_cmd:
             clamps["fractions"] = {"X_L": XL, "X_PV": XPV}
 
-        Pb_des = float(P_bess_kw)
-        Pb_after_noise = Pb_des
-        if self.noise["enabled"]:
+        # Mode-dependent decision
+        if self.mode == "offgrid":
+            # Use 100% of local resources
+            if XL > 0.0:
+                clamps["offgrid_force_XL0"] = {"prev_XL": XL, "reason": "meet_load"}
+            if XPV > 0.0:
+                clamps["offgrid_force_XPV0"] = {"prev_XPV": XPV, "reason": "use_all_pv"}
+            XL = 0.0
+            XPV = 0.0
+
+            served = load0   # full load
+            shed   = 0.0
+            usedpv = pv0     # full PV
+            curt   = 0.0
+
+            # No grid in off-grid
+            Pgrid_in  = 0.0
+            Pgrid_out = 0.0
+
+            # Ramp/power window for net BESS power (+ discharge, - charge)
             Pmax = self.bess["P_max"]
-            fallback = (0.05 * Pmax) if (not math.isinf(Pmax)) else 1.0
+            if math.isinf(Pmax):
+                Pmax = 1e12
+            if self.bess["ramp"] is not None:
+                Pb_min_ramp = self._prev_Pb - self.bess["ramp"]
+                Pb_max_ramp = self._prev_Pb + self.bess["ramp"]
+            else:
+                Pb_min_ramp = -Pmax
+                Pb_max_ramp = Pmax
+            Pb_min = max(-Pmax, Pb_min_ramp)
+            Pb_max = min( Pmax, Pb_max_ramp)
+
+            # Energy caps for this step
+            Pdis_cap_E = self.bess["eta_d"] * max(self.E_meas - self.bess["E_min"], 0.0) / max(self.dt_h, 1e-9)
+            Pch_cap_E  = max(self.bess["E_max"] - self.E_meas, 0.0) / (self.bess["eta_c"] * max(self.dt_h, 1e-9))
+
+            # Command equals the exact deficit/surplus before caps
+            Pb_des_raw  = served - usedpv            # = load0 - pv0  (>0 discharge, <0 charge)
+            Pb_des_ramp = min(max(Pb_des_raw, Pb_min), Pb_max)  # clamp by ramp/Pmax
+            if Pb_des_ramp >= 0.0:
+                Pb_des = min(Pb_des_ramp, Pdis_cap_E)           # discharge limited by energy
+            else:
+                Pb_des = -min(-Pb_des_ramp, Pch_cap_E)          # charge limited by energy
+
+            clamps["offgrid_cmd_from_diff"] = {
+                "delta_kw": float(served - usedpv),
+                "Pb_des_raw_kw": float(Pb_des_raw),
+                "ramp_window_kw": [float(Pb_min), float(Pb_max)],
+                "Pb_des_after_ramp_kw": float(Pb_des_ramp),
+                "Pdis_cap_E_kw": float(Pdis_cap_E),
+                "Pch_cap_E_kw": float(Pch_cap_E),
+                "Pb_des_after_caps_kw": float(Pb_des),
+            }
+        else:
+            # On-grid: use external command; fractions as passed (subject to auto-fixes later)
+            served = load0 * (1.0 - XL)
+            shed   = load0 - served
+            usedpv = pv0   * (1.0 - XPV)
+            curt   = pv0   - usedpv
+            Pgrid_in  = 0.0
+            Pgrid_out = 0.0
+            Pb_des = float(P_bess_kw)
+
+        # Actuator noise: apply ONLY in on-grid
+        Pb_after_noise = Pb_des
+        noise_applied = False
+        if (self.mode == "ongrid") and self.noise["enabled"]:
+            Pmax_for_noise = self.bess["P_max"]
+            fallback = (0.05 * Pmax_for_noise) if (not math.isinf(Pmax_for_noise)) else 1.0
             base = max(abs(Pb_des), fallback)
             sigma = max(0.0, self.noise["std_kw"]) + max(0.0, self.noise["std_frac"]) * base
             if sigma > 0.0:
@@ -269,18 +354,21 @@ class GridEnv:
                 eps = rng.gauss(0.0, sigma)
                 Pb_after_noise = Pb_des + eps
                 clamps["bess_noise"] = {"eps_kw": eps, "sigma_kw": sigma, "base_kw": base}
+                noise_applied = True
 
+        # Enforce Pmax and ramp on the (possibly noisy) command
         Pb = Pb_after_noise
         if abs(Pb) > self.bess["P_max"]:
             Pb = max(min(Pb, self.bess["P_max"]), -self.bess["P_max"])
             clamps["bess_pmax"] = Pb
         if self.bess["ramp"] is not None:
-            Pb_min = self._prev_Pb - self.bess["ramp"]
-            Pb_max = self._prev_Pb + self.bess["ramp"]
-            if Pb < Pb_min or Pb > Pb_max:
-                Pb = min(max(Pb, Pb_min), Pb_max)
-                clamps["bess_ramp"] = {"min": Pb_min, "max": Pb_max, "applied": Pb}
+            Pb_min_lim = self._prev_Pb - self.bess["ramp"]
+            Pb_max_lim = self._prev_Pb + self.bess["ramp"]
+            if Pb < Pb_min_lim or Pb > Pb_max_lim:
+                Pb = min(max(Pb, Pb_min_lim), Pb_max_lim)
+                clamps["bess_ramp"] = {"min": Pb_min_lim, "max": Pb_max_lim, "applied": Pb}
 
+        # Split into discharge/charge and enforce energy caps
         Pdis = max(Pb, 0.0)
         Pch  = max(-Pb, 0.0)
 
@@ -294,36 +382,34 @@ class GridEnv:
             if Pch > Pch_cap:
                 Pch = Pch_cap
                 clamps["bess_energy_max"] = Pch_cap
+
         Pb_eff = Pdis - Pch
 
-        served = load0 * (1.0 - XL)
-        shed   = load0 - served
-        usedpv = pv0   * (1.0 - XPV)
-        curt   = pv0   - usedpv
-
-        Pgrid_in = 0.0
-        Pgrid_out = 0.0
+        # Power balance
         supply   = usedpv + Pdis + Pgrid_in - Pgrid_out
         ref_line = served + Pch
         residual = ref_line - supply
 
+        # Post-balance corrections
         if self.mode == "offgrid":
+            # Deficit after max discharge -> increase shedding in 10% steps
             if residual > self.tol_kw:
                 needed_kw = residual
                 shed_step_kw = 0.10 * load0
                 if shed_step_kw > 1e-6:
                     num_steps_needed = math.ceil(needed_kw / shed_step_kw)
-                    new_total_XL = num_steps_needed * 0.10
-                    new_total_XL = min(1.0, new_total_XL)
+                    new_total_XL = min(1.0, num_steps_needed * 0.10)
                     if new_total_XL > XL:
                         dXL = new_total_XL - XL
                         XL = new_total_XL
                         served = load0 * (1.0 - XL)
                         shed   = load0 - served
                         clamps["offgrid_autofix_shed"] = {"dXL": dXL, "new_XL_pct": XL * 100}
+                # Recompute balance
                 supply   = usedpv + Pdis + Pgrid_in - Pgrid_out
                 ref_line = served + Pch
                 residual = ref_line - supply
+            # Surplus after max charge -> curtail PV
             elif residual < -self.tol_kw:
                 surplus = -residual
                 dXPV = min(1.0 - XPV, _safe_div(surplus, pv0))
@@ -335,7 +421,8 @@ class GridEnv:
                 supply   = usedpv + Pdis + Pgrid_in - Pgrid_out
                 ref_line = served + Pch
                 residual = ref_line - supply
-        else: # ongrid
+        else:
+            # On-grid balancing remains as before
             if residual > self.tol_kw:
                 take = min(residual, self.grid_caps["P_import_max"])
                 if take > 0:
@@ -347,8 +434,7 @@ class GridEnv:
                 shed_step_kw = 0.10 * load0
                 if shed_step_kw > 1e-6:
                     num_steps_needed = math.ceil(needed_kw / shed_step_kw)
-                    new_total_XL = num_steps_needed * 0.10
-                    new_total_XL = min(1.0, new_total_XL)
+                    new_total_XL = min(1.0, num_steps_needed * 0.10)
                     if new_total_XL > XL:
                         dXL = new_total_XL - XL
                         XL = new_total_XL
@@ -380,16 +466,20 @@ class GridEnv:
         if abs(residual) <= self.tol_kw:
             residual = 0.0
 
+        # SOC update
         E_next = self.E_meas + self.dt_h * (self.bess["eta_c"] * Pch - (1.0 / self.bess["eta_d"]) * Pdis)
         E_next = min(max(E_next, self.bess["E_min"]), self.bess["E_max"])
         soc_pct = 100.0 * (E_next / self.bess["E_nom"])
         if self.clamp_soc_pct:
             soc_pct = min(max(soc_pct, 0.0), 100.0)
 
+        # TOU applies only on-grid
         tou = 0.0
         if self.mode == "ongrid":
             key = _hour_key(pd.Timestamp(self.timestamp))
             tou = float(self.costs["TOU"].get(key, 0.0))
+
+        # Costs (grid cost only when on-grid)
         energy_grid_kwh = Pgrid_in * self.dt_h
         energy_shed_kwh = shed * self.dt_h
         energy_curt_kwh = curt * self.dt_h
@@ -398,9 +488,10 @@ class GridEnv:
         cost_curt = self.costs["c_curt"] * energy_curt_kwh
         cost_total = cost_grid + cost_shed + cost_curt
 
+        # Log row
         row = {
             "timestamp": pd.Timestamp(self.timestamp),
-            "cmd_P_bess_kw": float(P_bess_kw),
+            "cmd_P_bess_kw": float(Pb_des),
             "cmd_X_L": XL_cmd, "cmd_X_PV": XPV_cmd,
             "cmd_P_bess_kw_after_noise": Pb_after_noise,
             "Load_kw": load0, "PV_kw": pv0,
@@ -418,15 +509,20 @@ class GridEnv:
             "mode": self.mode,
             "clamps": clamps,
             "outage_active": self.outage_active,
-            "exec_time_sec": exec_time_sec
+            "exec_time_sec": exec_time_sec,
+            # Audit fields:
+            "noise_applied": bool(noise_applied),
+            "cmd_diff_kw": float(served - usedpv) if self.mode == "offgrid" else None,
         }
 
+        # Advance environment state
         self._rows.append(row)
         self.E_meas = E_next
         self._prev_Pb = Pb_eff
         self.timestamp = self.timestamp + pd.Timedelta(minutes=self.dt_h * 60)
         self.iter_k += 1
 
+        # Update outage state for the next step
         self._update_outage_status()
 
         self._log(
@@ -437,6 +533,7 @@ class GridEnv:
         return row, self.done()
 
     def to_dataframe(self) -> pd.DataFrame:
+        """Return logged rows as a time-indexed DataFrame (or empty if no rows)."""
         if not self._rows:
             return pd.DataFrame()
         return pd.DataFrame(self._rows).set_index("timestamp").sort_index()
