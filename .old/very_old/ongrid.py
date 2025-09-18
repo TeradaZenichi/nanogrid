@@ -4,19 +4,9 @@ opt/ongrid_stochastic.py
 
 OnGridMPC (ON-GRID) with a stochastic outage component.
 
-Key modelling choices implemented here:
-1) Only import from the grid is paid (export has no cost/revenue).
-2) Export capacity uses abs(Pmin) from EDS (in case Pmin is negative).
-3) Grid capacity limits apply only OUTSIDE the outage window; INSIDE it, grid is forced to zero.
-4) Objective regularization epsilon is applied only to fractional curtailments (X_L, X_PV),
-   not to P_gin / P_gout, to avoid biasing toward curtailment.
-5) Scenario probability π depends ONLY on the scenario c (outage starts at time c),
-   i.e., π = π(c), not π(t,c). The whole horizon of each scenario is weighted by π(c).
-6) BESS ramp at the first step is anchored to the previous-step net BESS power Pbess_hat,
-   analogous to how SoC uses E_hat for the initial condition.
-7) BESS degradation cost uses |P_bess| (linearized) instead of (P_ch + P_dis).
-8) NEW (A): Ramp limits are proportional to the step duration Δt (rate-based),
-   i.e., |ΔP| ≤ R_bess * (Δt / Δt_ref), with Δt_ref = timestep_1_min.
+Simplification: in each scenario c != "c0", both import and export are zeroed out
+for all t that satisfy c <= t <= c + timedelta(hours=H), where
+H = params["outage_duration_hours"].
 """
 
 import json
@@ -37,6 +27,14 @@ from .utils import (
 
 class OnGridMPC:
     def __init__(self, params_path: str = "data/parameters.json", relaxation: bool = False):
+        """
+        Initializes the OnGridMPC optimizer.
+
+        Args:
+            params_path (str): Path to the parameters JSON file.
+            relaxation (bool): If True, the load shedding variable is continuous (LP relaxation).
+                               If False, load shedding is discretized in 10% steps (MILP).
+        """
         self.params_path = Path(params_path)
         self.params = self._load_params()
         self.relaxation = relaxation
@@ -72,7 +70,7 @@ class OnGridMPC:
         p["c_pv_curt_per_kwh"] = float(costs["c_pv_curt_per_kwh"])
         p["tou_map"]           = dict(costs.get("EDS", {}))  # "HH:00" -> price
 
-        # BESS degradation cost ($/kWh cycled). If not given, derive from replacement and cycle life.
+        # BESS Degradation
         if "bess_degradation_per_kwh" in costs:
             p["c_bess_deg_per_kwh"] = float(costs["bess_degradation_per_kwh"])
         else:
@@ -100,7 +98,7 @@ class OnGridMPC:
 
         # Grid + stochastic
         p["P_grid_import_cap_kw"] = float(EDS.get("Pmax_kw", EDS.get("Pmax", 0.0)))
-        p["P_grid_export_cap_kw"] = float(abs(EDS.get("Pmin", 0.0)))
+        p["P_grid_export_cap_kw"] = float(EDS.get("Pmin", 0.0))
         p["outage_probability_pct"] = float(EDS.get("outage_probability_pct", 0.0))
         p["outage_duration_hours"]  = float(EDS.get("outage_duration_hours", 0.0))
 
@@ -110,12 +108,11 @@ class OnGridMPC:
     def build(self,
               start_dt: datetime,
               forecasts: Dict[str, Dict[datetime, float]],
-              E_hat_kwh: float,
-              P_bess_hat_kw: float = 0.0):
-
+              E_hat_kwh: float):
+        
         p = self.params
 
-        # Build time grid and set of contingencies (c are datetime instants)
+        # Build time grid and set of contingencies
         times, contingencies = build_time_and_contingencies_from_params(p, start_dt)
         self._times = list(times)
         self._contingencies = list(contingencies)
@@ -124,9 +121,6 @@ class OnGridMPC:
         m.T = Set(initialize=self._times, ordered=True)
         trans_pairs = predecessor_pairs(self._times)
         m.TRANS = Set(initialize=trans_pairs, dimen=2, ordered=True)
-
-        # First step in the horizon (used by initial conditions and first-step ramp)
-        first_t = self._times[0]
 
         # Main parameters
         m.c_shed    = Param(initialize=p["c_shed_per_kwh"])
@@ -143,24 +137,21 @@ class OnGridMPC:
         m.P_imp_cap = Param(initialize=max(0.0, p["P_grid_import_cap_kw"]))
         m.P_exp_cap = Param(initialize=max(0.0, p["P_grid_export_cap_kw"]))
 
-        # Outage duration H (hours)
+        # Outage duration (H)
         m.H = Param(initialize=float(p["outage_duration_hours"]))
 
-        # dt_h per step (hours)
+        # dt_h per step
         dt_h_map: Dict[datetime, float] = {}
         for (t0, t1) in trans_pairs:
             dt_h_map[t0] = (t1 - t0).total_seconds() / 3600.0
         dt_h_map[self._times[-1]] = dt_h_map[trans_pairs[-1][0]]
         m.dt_h = Param(m.T, initialize=lambda _, t: float(dt_h_map[t]))
 
-        # --- NEW (A): reference step (hours) to scale ramp by time, not by step count ---
-        dt_ref_h = max(1e-9, p["timestep_1_min"] / 60.0)  # e.g., 5 min -> 0.0833 h
-
-        # Profiles
+        # profiles
         m.Load_kw = Param(m.T, initialize=lambda _, t: float(forecasts["load_kw"][t]))
         m.PV_kw   = Param(m.T, initialize=lambda _, t: float(forecasts["pv_kw"][t]))
 
-        # Time-of-use (import) price map c_grid[t]
+        # TOU price map
         tou_map = p["tou_map"]
         price_map: Dict[datetime, float] = {}
         for t in self._times:
@@ -169,21 +160,20 @@ class OnGridMPC:
         m.c_grid = Param(m.T, initialize=lambda _, t: price_map[t])
 
         # ---------- Scenarios ----------
-        scenario_list = ["c0"] + self._contingencies  # c0 = no outage
+        scenario_list = ["c0"] + self._contingencies
         self._scenarios = scenario_list
         m.C = Set(initialize=scenario_list, ordered=True)
 
-        # Outage windows W[c] = {t in T: c <= t < c+H}  (applied with strict end)
         H = float(p["outage_duration_hours"])
         W: Dict[Any, List[datetime]] = {}
         for c in self._contingencies:
             end_c = c + timedelta(hours=H)
-            members = [t for t in self._times if (t >= c and t < end_c)]
+            members = [t for t in self._times if (t >= c and t <= end_c)]
             W[c] = members
         W["c0"] = []
         m.W = Set(m.C, within=m.T, ordered=True, initialize=lambda mm, c: W[c])
 
-        # Times strictly before the start of the outage (for non-anticipativity)
+        # Before[c] = {t in T: t < c}
         idx = {t: i for i, t in enumerate(self._times)}
         Before: Dict[Any, List[datetime]] = {"c0": []}
         for c in self._contingencies:
@@ -191,122 +181,100 @@ class OnGridMPC:
             Before[c] = self._times[:i_c]
         m.Before = Set(m.C, within=m.T, ordered=True, initialize=lambda mm, c: Before[c])
 
-        # ---------- Scenario probabilities π(c) ----------
+        # Probabilities pi(t,c)
         out_pct = float(p["outage_probability_pct"]) / 100.0
-        num_c = len(self._contingencies)
-        p_each = (out_pct / float(num_c)) if num_c > 0 else 0.0
+        dt_min_map = {t: m.dt_h[t] * 60.0 for t in self._times}
+        p_t = {t: out_pct * (value(dt_min_map[t]) / 1440.0) for t in self._times}
 
-        def piC_init(mm, c):
+        def pi_init(mm, t, c):
             if c == "c0":
-                return max(0.0, 1.0 - out_pct)
+                s = 0.0
+                for cc in self._contingencies:
+                    if t in W[cc]:
+                        s += p_t[t]
+                return max(0.0, 1.0 - s)
             else:
-                return p_each
-        m.piC = Param(m.C, initialize=piC_init, within=NonNegativeReals)
-        _sum_pi = sum(value(m.piC[c]) for c in m.C)
-        assert abs(_sum_pi - 1.0) < 1e-8, f"Sum of scenario probabilities is {_sum_pi}, expected 1.0"
+                return p_t[t] if (c in self._contingencies and t in W[c]) else 0.0
+
+        m.pi = Param(m.T, m.C, initialize=pi_init, within=NonNegativeReals)
 
         # ---------- Variables ----------
         if self.relaxation:
+            # Continuous relaxation (LP)
             m.X_L = Var(m.T, m.C, domain=UnitInterval)
         else:
+            # Discrete steps (MILP)
             m.X_L    = Var(m.T, m.C, domain=UnitInterval)
             m.n_shed = Var(m.T, m.C, domain=NonNegativeIntegers, bounds=(0, 10))
+            # Link the continuous variable to the integer steps across all scenarios
             m.ShedDiscretization = Constraint(
-                m.T, m.C, rule=lambda m, t, c: m.X_L[t, c] == 0.1 * m.n_shed[t, c]
+                m.T, m.C,
+                rule=lambda m, t, c: m.X_L[t, c] == 0.1 * m.n_shed[t, c]
             )
-
+            
         m.X_PV   = Var(m.T, m.C, domain=UnitInterval)
         m.P_ch   = Var(m.T, m.C, domain=NonNegativeReals)
         m.P_dis  = Var(m.T, m.C, domain=NonNegativeReals)
         m.P_bess = Var(m.T, m.C, domain=Reals)
         m.gamma  = Var(m.T, m.C, domain=Binary)
-
-        # E non-negative
-        m.E      = Var(m.T, m.C, domain=NonNegativeReals)
-
-        m.P_gin  = Var(m.T, m.C, domain=NonNegativeReals)
-        m.P_gout = Var(m.T, m.C, domain=NonNegativeReals)
-
-        # Linearize |P_bess|
-        m.Pbess_abs = Var(m.T, m.C, domain=NonNegativeReals)
-        m.AbsPos = Constraint(m.T, m.C, rule=lambda mm, t, c: mm.Pbess_abs[t, c] >=  mm.P_bess[t, c])
-        m.AbsNeg = Constraint(m.T, m.C, rule=lambda mm, t, c: mm.Pbess_abs[t, c] >= -mm.P_bess[t, c])
+        m.E      = Var(m.T, m.C, domain=Reals)
+        m.P_gin  = Var(m.T, m.C, domain=NonNegativeReals)  # import
+        m.P_gout = Var(m.T, m.C, domain=NonNegativeReals)  # export
 
         # ---------- Objective ----------
         def obj_rule(mm):
             eps = 1e-12
             return sum(
-                mm.piC[c] * mm.dt_h[t] * (
-                    mm.c_shed    * mm.Load_kw[t] * mm.X_L[t, c] +
-                    mm.c_pv_curt * mm.PV_kw[t]   * mm.X_PV[t, c] +
+                mm.pi[t, c] * mm.dt_h[t] * (
+                    mm.c_shed * mm.Load_kw[t] * mm.X_L[t, c] +
+                    mm.c_pv_curt * mm.PV_kw[t] * mm.X_PV[t, c] +
                     mm.c_grid[t] * mm.P_gin[t, c] +
-                    mm.c_deg     * mm.Pbess_abs[t, c]
+                    mm.c_deg * (mm.P_ch[t, c] + mm.P_dis[t, c])
                 )
-                + eps * (mm.X_L[t, c] + mm.X_PV[t, c])
+                + eps * (mm.X_L[t, c] + mm.X_PV[t, c] + mm.P_gin[t, c] + mm.P_gout[t, c])
                 for t in mm.T for c in mm.C
             )
         m.Objective = Objective(rule=obj_rule, sense=minimize)
 
         # ---------- Constraints ----------
-        # Power balance
         m.Balance = Constraint(m.T, m.C, rule=lambda mm, t, c:
             mm.PV_kw[t] * (1 - mm.X_PV[t, c]) + mm.P_dis[t, c] - mm.P_ch[t, c] + mm.P_gin[t, c] - mm.P_gout[t, c]
             == mm.Load_kw[t] * (1 - mm.X_L[t, c])
         )
 
-        # Link P_bess = P_dis - P_ch
         m.PbessLink = Constraint(m.T, m.C, rule=lambda mm, t, c:
             mm.P_bess[t, c] == mm.P_dis[t, c] - mm.P_ch[t, c]
         )
 
-        # BESS dynamics
         m.Dynamics = Constraint(m.TRANS, m.C, rule=lambda mm, t0, t1, c:
             mm.E[t1, c] == mm.E[t0, c] + mm.dt_h[t0] * (mm.eta_c * mm.P_ch[t0, c] - (1.0 / mm.eta_d) * mm.P_dis[t0, c])
         )
 
-        # SoC bounds
         m.SoC_Lo = Constraint(m.T, m.C, rule=lambda mm, t, c: mm.E[t, c] >= mm.f_soc_min * mm.E_nom)
         m.SoC_Hi = Constraint(m.T, m.C, rule=lambda mm, t, c: mm.E[t, c] <= mm.f_soc_max * mm.E_nom)
 
-        # Energy-to-power limits
         E_min = p["soc_min_frac"] * p["E_nom_kwh"]
         E_max = p["soc_max_frac"] * p["E_nom_kwh"]
         m.DischargeEnergyCap = Constraint(m.T, m.C, rule=lambda mm, t, c:
             mm.P_dis[t, c] <= mm.eta_d * (mm.E[t, c] - E_min) / mm.dt_h[t]
         )
         m.ChargeEnergyCap = Constraint(m.T, m.C, rule=lambda mm, t, c:
-            mm.P_ch[t, c] <= (E_max - mm.E[t, c]) / (mm.eta_c * mm.dt_h[t])
-        )
+            mm.P_ch[t, c] <= (E_max - mm.E[t, c]) / (mm.eta_c * mm.dt_h[t]
+        ))
 
-        # Converter limits (charge vs discharge)
         m.ChargeLimit    = Constraint(m.T, m.C, rule=lambda mm, t, c: mm.P_ch[t, c] <= mm.P_ch_max * mm.gamma[t, c])
         m.DischargeLimit = Constraint(m.T, m.C, rule=lambda mm, t, c: mm.P_dis[t, c] <= mm.P_dis_max * (1 - mm.gamma[t, c]))
 
-        # ----------------- Ramp limits (NEW A: rate-based, scaled by Δt/dt_ref) -----------------
-        m.RampLo = Constraint(m.TRANS, m.C, rule=lambda mm, t0, t1, c:
-            mm.P_bess[t1, c] - mm.P_bess[t0, c] >= -mm.R_bess * (mm.dt_h[t0] / dt_ref_h)
-        )
-        m.RampHi = Constraint(m.TRANS, m.C, rule=lambda mm, t0, t1, c:
-            mm.P_bess[t1, c] - mm.P_bess[t0, c] <=  mm.R_bess * (mm.dt_h[t0] / dt_ref_h)
-        )
+        m.RampLo = Constraint(m.TRANS, m.C, rule=lambda mm, t0, t1, c: mm.P_bess[t1, c] - mm.P_bess[t0, c] >= -mm.R_bess)
+        m.RampHi = Constraint(m.TRANS, m.C, rule=lambda mm, t0, t1, c: mm.P_bess[t1, c] - mm.P_bess[t0, c] <=  mm.R_bess)
 
-        # NEW (A): first-step ramp vs previous-step net power (scaled by Δt of first step)
-        m.Pbess_hat = Param(initialize=float(P_bess_hat_kw))
-        m.RampFromPrevLo = Constraint(m.C, rule=lambda mm, c:
-            mm.P_bess[first_t, c] - mm.Pbess_hat >= -mm.R_bess * (mm.dt_h[first_t] / dt_ref_h)
-        )
-        m.RampFromPrevHi = Constraint(m.C, rule=lambda mm, c:
-            mm.P_bess[first_t, c] - mm.Pbess_hat <=  mm.R_bess * (mm.dt_h[first_t] / dt_ref_h)
-        )
-
-        # Grid caps outside outage
         m.GridImportCap = Constraint(m.T, m.C, rule=lambda mm, t, c:
-            (mm.P_gin[t, c]  <= mm.P_imp_cap) if (c == "c0" or t not in mm.W[c]) else Constraint.Skip
+            (mm.P_gin[t, c] <= mm.P_imp_cap) if (c == "c0" or (c in mm.T and t not in mm.W[c])) else Constraint.Skip
         )
         m.GridExportCap = Constraint(m.T, m.C, rule=lambda mm, t, c:
-            (mm.P_gout[t, c] <= mm.P_exp_cap) if (c == "c0" or t not in mm.W[c]) else Constraint.Skip
+            (mm.P_gout[t, c] <= mm.P_exp_cap) if (c == "c0" or (c in mm.T and t not in mm.W[c])) else Constraint.Skip
         )
-        # Grid dead during outage
+
         m.GridZeroIn  = Constraint(m.T, m.C, rule=lambda mm, t, c:
             (mm.P_gin[t, c]  == 0.0) if (c != "c0" and t in mm.W[c]) else Constraint.Skip
         )
@@ -314,19 +282,12 @@ class OnGridMPC:
             (mm.P_gout[t, c] == 0.0) if (c != "c0" and t in mm.W[c]) else Constraint.Skip
         )
 
-        # Initial SoC equal across scenarios
+        first_t = self._times[0]
         m.E_hat = Param(initialize=float(E_hat_kwh))
         m.InitialCond = Constraint(m.C, rule=lambda mm, c: mm.E[first_t, c] == mm.E_hat)
 
-        # Partial non-anticipativity BEFORE outage start
         m.EequalPre = Constraint(m.T, m.C, rule=lambda mm, t, c:
             (mm.E[t, c] == mm.E[t, "c0"]) if (c != "c0" and t in mm.Before[c]) else Constraint.Skip
-        )
-        m.XLEequalPre = Constraint(m.T, m.C, rule=lambda mm, t, c:
-            (mm.X_L[t, c] == mm.X_L[t, "c0"]) if (c != "c0" and t in mm.Before[c]) else Constraint.Skip
-        )
-        m.XPVEequalPre = Constraint(m.T, m.C, rule=lambda mm, t, c:
-            (mm.X_PV[t, c] == mm.X_PV[t, "c0"]) if (c != "c0" and t in mm.Before[c]) else Constraint.Skip
         )
 
         self.model = m
@@ -334,6 +295,7 @@ class OnGridMPC:
 
     # --------------------- solve & extract ---------------------
     def solve(self, solver_name="gurobi", tee=True, **solver_opts):
+        """Solves the optimization model."""
         solver = SolverFactory(solver_name)
         for k, v in solver_opts.items():
             solver.options[k] = v
@@ -341,6 +303,7 @@ class OnGridMPC:
         return self.results
 
     def extract_first_step(self, scenario="c0") -> Dict[str, float]:
+        """Extracts the solution for the first time step for a given scenario."""
         t0 = self._times[0]
         m = self.model
         c = scenario
@@ -359,21 +322,28 @@ class OnGridMPC:
         }
 
     def extract_first_step_all(self) -> Dict[Any, Dict[str, float]]:
+        """Extracts the first-step solution for all scenarios."""
         return {c: self.extract_first_step(scenario=c) for c in (self._scenarios or ["c0"])}
-
+        
     def extract_full_solution(self) -> Dict[str, Any]:
+        """
+        Extracts the full planned trajectory over the optimization horizon for all scenarios.
+        """
         if self.model is None or self._times is None or self._scenarios is None:
             return {}
+
         m = self.model
-        solution = {"decision_time": self._times[0].isoformat(), "scenarios": {}}
+        solution = {
+            "decision_time": self._times[0].isoformat(),
+            "scenarios": {}
+        }
+
         for c in self._scenarios:
             scenario_data = []
             for t in self._times:
                 step_data = {
                     "timestamp": t.isoformat(),
                     "P_bess_kw": value(m.P_bess[t, c]),
-                    "P_load_kw": value(m.Load_kw[t]),
-                    "P_pv_kw": value(m.PV_kw[t]),
                     "X_L": value(m.X_L[t, c]),
                     "X_PV": value(m.X_PV[t, c]),
                     "P_grid_in_kw": value(m.P_gin[t, c]),
@@ -381,6 +351,9 @@ class OnGridMPC:
                     "E_kwh": value(m.E[t, c])
                 }
                 scenario_data.append(step_data)
+            
+            # Use the contingency datetime as a key if it's not the base case
             scenario_key = "c0_base_case" if c == "c0" else f"contingency_{c.isoformat()}"
             solution["scenarios"][scenario_key] = scenario_data
+            
         return solution

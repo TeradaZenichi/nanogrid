@@ -6,7 +6,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-outputs/
-predictions/
-figures/
 
