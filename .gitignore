@@ -6,4 +6,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+outputs/
+figures/
 
