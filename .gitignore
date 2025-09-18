@@ -8,4 +8,4 @@ __pycache__/
 *.pyd
 outputs/
 figures/
-predicions/
+predictions/
