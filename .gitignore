@@ -1,8 +1,12 @@
 .forget/
 .venv/
 venv/
+env_fcst/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+outputs/
+predictions/
+figures/
 

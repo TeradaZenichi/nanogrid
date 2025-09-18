@@ -1,0 +1,25 @@
+{
+  "config": {
+    "csv_path": "data/load_5min_train_smoothed_normalized.csv",
+    "horizon_minutes": 60,
+    "lookback_hours": 4.0,
+    "train_ratio": 0.75,
+    "step_minutes": 5,
+    "lookback_steps": 48,
+    "horizon_steps": 12,
+    "features": [
+      "p_norm",
+      "dow_sin",
+      "dow_cos",
+      "tod_sin",
+      "tod_cos"
+    ],
+    "seed": 42,
+    "model_name": "llstm_vstf_load_5min_60min_48"
+  },
+  "val_metrics": {
+    "MAE": 0.010902614332735538,
+    "MSE": 0.00048039117245934904,
+    "R2": 0.9736794233322144
+  }
+}

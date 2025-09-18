@@ -1,0 +1,27 @@
+{
+  "config": {
+    "csv_path": "data/pv_5min_train.csv",
+    "backend": "lstm",
+    "resample_rule": "H",
+    "resample_agg": "mean",
+    "lookback_hours": 8,
+    "horizon_hours": 36,
+    "train_ratio": 0.75,
+    "lookback_steps": 8,
+    "horizon_steps": 36,
+    "features": [
+      "p_norm",
+      "dow_sin",
+      "dow_cos",
+      "hod_sin",
+      "hod_cos"
+    ],
+    "seed": 42,
+    "model_name": "lstm_hourly_pv_36h_8"
+  },
+  "val_metrics": {
+    "MAE": 0.07226390391588211,
+    "MSE": 0.01481271255761385,
+    "R2": 0.799878716468811
+  }
+}

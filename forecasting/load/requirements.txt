@@ -1,0 +1,14 @@
+# Core
+numpy
+pandas
+matplotlib
+
+# ML / DL
+tensorflow            # Keras incluido en TF 2.x
+scikit-learn
+xgboost
+optuna
+
+# Utilidades
+packaging
+python-dateutil
