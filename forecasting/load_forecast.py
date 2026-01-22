@@ -34,7 +34,7 @@ import pandas as pd
 # --------------------
 LOAD_5MIN_CSV = os.getenv("LOAD_5MIN_CSV", "data/load_5min_test.csv")
 TRAIN_RESAMPLE_AGG = os.getenv("TRAIN_RESAMPLE_AGG", "mean")  # mean | median | sum
-MAX_INTERVALS = int(os.getenv("FORECAST_MAX_INTERVALS", "180"))  # default: 36h @ 5-min → 180 intervals
+MAX_INTERVALS = int(os.getenv("FORECAST_MAX_INTERVALS", "432"))  # default: 36h @ 5-min → 180 intervals
 
 # Fallback configs (used only if caller does not pass configs)
 LOAD_VSTF_DEFAULT = {"step_minutes": 5, "lookback_steps": 96, "horizon_steps": 48}

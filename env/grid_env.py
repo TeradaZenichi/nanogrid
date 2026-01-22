@@ -111,6 +111,8 @@ class GridEnv:
 
         # Series scaling and time vector
         scaling = _derive_scaling_params(self.p)
+        self.pv_scaling = scaling["P_PV_nom_kw"]
+        self.load_scaling = scaling["P_L_nom_kw"]
         self.load_kw_s, self.pv_kw_s = load_series_scaled(scaling, self.load_csv, self.pv_csv)
         self.dt_min = _resolve_dt_vector(self.p)
 

@@ -360,17 +360,19 @@ def generate_plots_for_timestamp(target_dt_str: str, mpc_plans_dir: str):
 if __name__ == "__main__":
 
     # 3D plot
-    MPC_SOLUTIONS_DIR = "outputs/mpc_solutions"
-    OUTPUT_DIR = "outputs/3d_plots"
+    TYPE = "Real_36h"  # "ideal" ou "real"
+    # TYPE = "Ideal_36h"  # "ideal" ou "real"
+    MPC_SOLUTIONS_DIR = f"outputs/{TYPE}/mpc_solutions"
+    OUTPUT_DIR = f"outputs/{TYPE}/3d_plots"
 
     # Plot all scenarios of a single timestamp
-    TARGET_DATETIME = "2009-05-01 04:15:00"
-    MPC_SOLUTIONS_DIR = "outputs/mpc_solutions"
+    TARGET_DATETIME = "2009-05-01 12:00:00"
+    MPC_SOLUTIONS_DIR = f"outputs/{TYPE}/mpc_solutions"
 
-    # generate_plots_for_timestamp(TARGET_DATETIME, MPC_SOLUTIONS_DIR)
-    # create_mpc_evolution_3d_plots(MPC_SOLUTIONS_DIR, OUTPUT_DIR)
+    generate_plots_for_timestamp(TARGET_DATETIME, MPC_SOLUTIONS_DIR)
+    # create_mpc_evolution_3d_plots(MPC_SOLUTIONS_DIR, OUTPUT_DIR) 
 
     FROM = pd.Timestamp("2009-05-01 00:00:00")
-    TO = pd.Timestamp("2009-05-03 00:00:00")
-    df = pd.read_csv("outputs/operation_real.csv", index_col=0, parse_dates=True)
+    TO = pd.Timestamp("2009-05-10 00:00:00")
+    df = pd.read_csv(f"outputs/{TYPE}/operation_real.csv", index_col=0, parse_dates=True)
     plot_custom_dispatch_with_soc(df, start_dt=FROM, end_dt=TO)

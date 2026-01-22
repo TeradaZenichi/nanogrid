@@ -15,6 +15,8 @@ import os
 import numpy as np
 import pandas as pd
 from tensorflow.keras.models import load_model
+import matplotlib.pyplot as plt
+
 
 import forecasting  # local package: folder 'forecast' next to this file
 
@@ -55,9 +57,15 @@ def main():
     m_st_pv     = _load_keras(PV_ST_PATH)
     print("Models loaded.")
 
+    pv_df = pd.read_csv("data/pv_5min_test.csv", parse_dates=["timestamp"], index_col="timestamp")
+    load_df = pd.read_csv("data/load_5min_test.csv", parse_dates=["timestamp"], index_col="timestamp")
+
+    
+
     # Example call with a date from 2009
     dt = "2009-04-30 12:00:00"
-    intervals = 180  # default (36h @ 5-min)
+    final = str(pd.Timestamp(dt) + pd.Timedelta(minutes=5*432))
+    intervals = 432  # default (36h @ 5-min)
 
     # LOAD forecast (vector of shape (intervals,))
     y_load = forecasting.load(
@@ -86,6 +94,21 @@ def main():
     np.set_printoptions(precision=4, suppress=True)
     print("[LOAD] shape:", y_load.shape, "head:", y_load[:10])
     print("[PV]   shape:", y_pv.shape,   "head:", y_pv[:10])
+    
+    
+    plt.figure(figsize=(12,6))
+    plt.plot(pv_df.loc[dt:final].index, pv_df.loc[dt:final].p_norm, label="PV Actual", color="blue")
+    plt.plot(pd.date_range(start=dt, periods=intervals, freq="5min"), y_pv, label="PV Forecasting", color="cyan", linestyle="--")
+    plt.plot(load_df.loc[dt:final].index, load_df.loc[dt:final].p_norm, label="Load Actual", color="red")
+    plt.plot(pd.date_range(start=dt, periods=intervals, freq="5min"), y_load, label="Load Forecasting", color="orange", linestyle="--")
+    plt.tight_layout()
+    plt.xlabel("Timestamp")
+    plt.ylabel("Normalized Power")
+    plt.title("Forecast Example (5-min resolution)")
+    plt.legend()
+    plt.savefig("forecast_example.pdf", dpi=150)
+
+    a = 1
 
 if __name__ == "__main__":
     main()

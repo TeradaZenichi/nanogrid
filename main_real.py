@@ -7,21 +7,25 @@ from pathlib import Path
 # --- Local Imports ---
 from env.grid_env import GridEnv
 from opt.ongrid import OnGridMPC as OnGridStochasticMPC
-from forecasting.get_forecasting import get_window
+from forecasting.get_forecasting import ForecastMPC, get_window
 from opt.plot_results import (
     plot_identity_and_soc,
     plot_power_balance_stacked,
     plot_custom_dispatch_with_soc
 )
 
+intervals = 432  # default (36h @ 5-min)
+
+
 # ==========================
 # Configuration
 # ==========================
-LOAD_CSV = "data/load_5min_test_smoothed_normalized.csv"
+LOAD_CSV = "data/load_5min_test.csv"
 PV_CSV   = "data/pv_5min_test.csv"
 PARAMS_JSON = "data/parameters.json"
 OUTPUT_DIR = Path("outputs")
 MPC_PLANS_DIR = OUTPUT_DIR / "mpc_solutions"
+
 
 # Simulation window
 START_TS = pd.Timestamp("2009-05-01 00:00:00")
@@ -65,6 +69,14 @@ if __name__ == "__main__":
         debug=True,
     )
 
+    forecast_mpc = ForecastMPC(
+        params= dict(),          
+        load_kw_s=env.load_kw_s,
+        pv_kw_s=env.pv_kw_s,
+        pv_scaling=env.pv_scaling,
+        load_scaling=env.load_scaling
+    )
+
     # Track previous-step BESS net power to anchor ramp on the first on-grid step
     pbess_prev_kw = 0.0
 
@@ -74,13 +86,22 @@ if __name__ == "__main__":
 
         # Current state & forecasts for the window
         current_time = env.timestamp
-        forecasts = get_window(current_time, env.load_kw_s, env.pv_kw_s, env.dt_min)
+
+        forecasts = forecast_mpc.get_forecasts(
+            start_dt0=current_time,
+            intervals=intervals,      
+            dt_min=env.dt_min,
+            include_actuals=False         # MPC precisa dos hat; reais são opcionais
+        )
+
+
+        # forecasts = get_window(current_time, env.load_kw_s, env.pv_kw_s, env.dt_min)
 
         # Mode decided by env in the previous step's tail
         current_mode = env.mode
 
         if current_mode == "offgrid":
-            print(f"\n--- [Off-Grid Mode] Timestamp: {current_time} ---")
+            print(f"\n--- [(Real operation) Off-Grid Mode] Timestamp: {current_time} ---")
             # No off-grid MPC: env will control BESS internally in step()
             step0 = None  # placeholder so we send neutral commands
             full_plan = {
@@ -90,7 +111,7 @@ if __name__ == "__main__":
                 "note": "Env controls BESS; PV surplus used to charge; XL/XPV forced internally."
             }
         else:
-            print(f"\n--- [On-Grid Mode] Timestamp: {current_time} ---")
+            print(f"\n--- [(Real operation) On-Grid Mode] Timestamp: {current_time} ---")
             # Build on-grid stochastic MPC with first-step ramp anchored to pbess_prev_kw
             try:
                 mpc_ongrid.build(

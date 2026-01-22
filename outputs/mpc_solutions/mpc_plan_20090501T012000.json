@@ -1,6 +1,0 @@
-{
-    "mode": "offgrid",
-    "autonomous_bess": true,
-    "timestamp": "2009-05-01T01:20:00",
-    "note": "Env controls BESS; PV surplus used to charge; XL/XPV forced internally."
-}
