@@ -1,23 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Unified LOAD & PV VSTF+ST real-time simulation (36h ahead @ 5-min)
+Unified LOAD & PV real-time simulation combining very-short-term (5-min) and
+short-term hourly forecasts over a 36h horizon.
 
-Comportamiento
---------------
-- Rejilla de salida: cada 5 min por 36h (432 puntos).
-- DEFAULT: VSTF domina todo su horizonte (p.ej., 48 pasos = 4h a 5-min).
-- El resto del horizonte se rellena con ST (horaria) interpolada a 5-min.
-- Modo legado opcional: usar VSTF solo hasta la próxima hora en punto.
-- PV: p_norm = 0 fuera de [DAY_START, DAY_END); también se “clamp” las predicciones.
-- Overlays de depuración con las últimas K consultas.
-- Ventana de simulación flexible para no parar tras un único intervalo.
-
-Author: You
+Behavior
+--------
+- Output grid: every 5 minutes for 36 hours (432 points).
+- Default: VSTF (5-min) covers its full horizon; remaining horizon is filled
+  with ST hourly forecasts interpolated to 5-min.
+- Optional legacy mode: use VSTF only until the next full hour.
+- PV: p_norm is forced to zero outside the daylight window.
+- Debug overlays keep recent queries for quick visual checks.
+- Simulation window is flexible so runs can span multiple queries.
 """
 
 import os
 import json
 import time
+import pickle
 from collections import deque
 from typing import Dict, Tuple, Optional, List
 
@@ -27,6 +27,18 @@ import matplotlib.pyplot as plt
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
+
+try:
+    import joblib
+    JOBLIB_AVAILABLE = True
+except Exception:
+    JOBLIB_AVAILABLE = False
+
+try:
+    import xgboost  # noqa: F401
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
 
 # =========================
 # User config
@@ -43,20 +55,39 @@ TOTAL_HOURS = 36
 STEP_MIN    = 5
 H_STEPS     = TOTAL_HOURS * 12  # 432
 
-# Defaults por dominio (si no hay *_config.json)
-LOAD_VSTF_DEFAULT = {"step_minutes": 5,  "lookback_steps": 96, "horizon_steps": 48}  # 8h LB, 4h H
+# Defaults per domain (used if config JSON is missing)
+LOAD_VSTF_DEFAULT = {"step_minutes": 5,  "lookback_steps": 96, "horizon_steps": 48}
 LOAD_ST_DEFAULT   = {"step_minutes": 60, "lookback_steps": 8,  "horizon_steps": 36}
-PV_VSTF_DEFAULT   = {"step_minutes": 5,  "lookback_steps": 48, "horizon_steps": 12}
-PV_ST_DEFAULT     = {"step_minutes": 60, "lookback_steps": 8,  "horizon_steps": 36}
+PV_VSTF_DEFAULT   = {"step_minutes": 5,  "lookback_steps": 60, "horizon_steps": 48}
+PV_ST_DEFAULT     = {"step_minutes": 60, "lookback_steps": 16, "horizon_steps": 36}
 
-def _candidates_vstf(domain: str, step_min: int, total_min: int, lb: int) -> List[str]:
-    return [
-        f"models/lstm_vstf_{domain}_{step_min}min_{total_min}min_{lb}.keras",
-        f"models/llstm_vstf_{domain}_{step_min}min_{total_min}min_{lb}.keras",
-    ]
+# Candidate model paths (XGBoost first, LSTM fallback)
+LOAD_VSTF_CANDIDATES = [
+    "models/xgb_vstf_load_5min_60min_48.joblib",
+    "models/xgb_vstf_load_5min_60min_48.pkl",
+    "models/lstm_vstf_load_5min_60min_48.keras",
+    "models/llstm_vstf_load_5min_60min_48.keras",
+    "models/lstm_vstf_load_5min_240min_96.keras",
+]
 
-def _path_hourly(domain: str, H: int, LB: int) -> str:
-    return f"models/lstm_hourly_{domain}_{H}h_{LB}.keras"
+LOAD_ST_CANDIDATES = [
+    "models/xgb_hourly_load_36h_8.joblib",
+    "models/xgb_hourly_load_36h_8.pkl",
+    "models/lstm_hourly_load_36h_8.keras",
+]
+
+PV_VSTF_CANDIDATES = [
+    "models/xgb_vstf_pv_5min_60min_48.joblib",
+    "models/xgb_vstf_pv_5min_60min_48.pkl",
+    "models/lstm_vstf_pv_5min_60min_48.keras",
+    "models/llstm_vstf_pv_5min_60min_48.keras",
+]
+
+PV_ST_CANDIDATES = [
+    "models/xgb_hourly_pv_36h_16.joblib",
+    "models/xgb_hourly_pv_36h_16.pkl",
+    "models/lstm_hourly_pv_36h_8.keras",
+]
 
 INITIAL_QUERY_TIME   = "2009-04-30 12:00:00"
 AUTO_START_MODE      = "earliest"   # "latest" | "latest_minus_hours" | "earliest"
@@ -93,7 +124,7 @@ def _daylight_mask(index: pd.DatetimeIndex, start_hhmm: str, end_hhmm: str) -> n
 
 def enforce_pv_zero_outside_window(df: pd.DataFrame, start_hhmm: str, end_hhmm: str) -> pd.DataFrame:
     if "p_norm" not in df.columns:
-        raise ValueError("DataFrame debe contener 'p_norm'.")
+        raise ValueError("Input DataFrame must contain 'p_norm'.")
     out = df.copy()
     mask = _daylight_mask(out.index, start_hhmm, end_hhmm)
     out.loc[~mask, "p_norm"] = 0.0
@@ -136,37 +167,78 @@ def add_cyclical_features_hourly(df: pd.DataFrame) -> pd.DataFrame:
 # Model loading helpers
 # =========================
 def _try_load_config(model_path: str) -> Optional[Dict]:
-    cfg_path = model_path[:-6] + "_config.json" if model_path.endswith(".keras") else model_path + "_config.json"
+    """Load companion _config.json next to keras/joblib/pkl artifacts."""
+    if model_path.endswith(".keras"):
+        base = model_path[: -len(".keras")]
+    elif model_path.endswith(".joblib"):
+        base = model_path[: -len(".joblib")]
+    elif model_path.endswith(".pkl"):
+        base = model_path[: -len(".pkl")]
+    else:
+        base = model_path
+    cfg_path = base + "_config.json"
     if os.path.exists(cfg_path):
         with open(cfg_path, "r") as f:
             meta = json.load(f)
         return meta.get("config", meta)
     return None
 
+
 def get_model_cfg(path: str, fallback: Dict) -> Dict:
-    cfg = _try_load_config(path)
-    if cfg is None:
-        cfg = fallback.copy()
+    cfg = _try_load_config(path) or fallback.copy()
     return {
-        "step_minutes": int(cfg.get("step_minutes", fallback["step_minutes"])),
-        "lookback_steps": int(cfg.get("lookback_steps", fallback["lookback_steps"])),
-        "horizon_steps": int(cfg.get("horizon_steps", fallback["horizon_steps"])),
+        "step_minutes": int(cfg.get("step_minutes", fallback.get("step_minutes", 5))),
+        "lookback_steps": int(cfg.get("lookback_steps", fallback.get("lookback_steps", 1))),
+        "horizon_steps": int(cfg.get("horizon_steps", fallback.get("horizon_steps", 1))),
+        "backend": cfg.get("backend"),
     }
+
 
 def load_keras_safely(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Model not found: {path}")
-    # Soporta distintas versiones de TF/Keras
     try:
         return load_model(path, compile=False, safe_mode=False)
     except TypeError:
         return load_model(path, compile=False)
 
+
+def load_xgb_models(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model not found: {path}")
+    if JOBLIB_AVAILABLE:
+        return joblib.load(path)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def resolve_existing_path(cands: List[str]) -> str:
     for p in cands:
         if os.path.exists(p):
             return p
-    raise FileNotFoundError("Ninguna de estas rutas de modelo existe:\n" + "\n".join(cands))
+    raise FileNotFoundError("None of the candidate model paths exist:\n" + "\n".join(cands))
+
+
+def load_model_bundle(path: str, fallback: Dict) -> Dict:
+    cfg = get_model_cfg(path, fallback)
+    inferred_backend = cfg.get("backend")
+    if inferred_backend not in ("lstm", "xgb_direct"):
+        inferred_backend = "xgb_direct" if path.endswith((".joblib", ".pkl")) else "lstm"
+
+    if inferred_backend == "xgb_direct":
+        model = load_xgb_models(path)
+    else:
+        model = load_keras_safely(path)
+
+    return {
+        "backend": inferred_backend,
+        "model": model,
+        "cfg": {
+            "step_minutes": cfg["step_minutes"],
+            "lookback_steps": cfg["lookback_steps"],
+            "horizon_steps": cfg["horizon_steps"],
+        },
+    }
 
 # =========================
 # Inputs (end-aligned)
@@ -174,7 +246,7 @@ def resolve_existing_path(cands: List[str]) -> str:
 def build_vstf_input(df5: pd.DataFrame, t_now: pd.Timestamp, lookback_steps: int) -> np.ndarray:
     req = ["p_norm","dow_sin","dow_cos","tod_sin","tod_cos"]
     if not all(c in df5.columns for c in req):
-        raise ValueError("Faltan features 5-min.")
+        raise ValueError("Missing required 5-min features.")
     idx_window = pd.date_range(end=t_now, periods=lookback_steps, freq="5min")
     Xw = df5.reindex(idx_window)
     if Xw["p_norm"].isna().any():
@@ -184,13 +256,85 @@ def build_vstf_input(df5: pd.DataFrame, t_now: pd.Timestamp, lookback_steps: int
 def build_st_input_for_anchor(dfH: pd.DataFrame, anchor_hour: pd.Timestamp, lookback_steps: int) -> np.ndarray:
     req = ["p_norm","dow_sin","dow_cos","hod_sin","hod_cos"]
     if not all(c in dfH.columns for c in req):
-        raise ValueError("Faltan features horarias.")
+        raise ValueError("Missing required hourly features.")
     anchor_hour = pd.Timestamp(anchor_hour).floor("h")
     idx_window = pd.date_range(end=anchor_hour, periods=lookback_steps, freq="h")
     Xw = dfH.reindex(idx_window)
     if Xw["p_norm"].isna().any():
-        raise ValueError("Historial horario insuficiente para la ventana ST.")
+        raise ValueError("Not enough hourly history for the ST window.")
     return Xw[req].values.astype(np.float32)[np.newaxis, :, :]
+
+
+# =========================
+# XGBoost inference helpers
+# =========================
+def _lags_from_series(series: pd.Series, end_time: pd.Timestamp, step_minutes: int, lookback_steps: int) -> np.ndarray:
+    idx_window = pd.date_range(end=end_time, periods=lookback_steps, freq=f"{step_minutes}min")
+    window = series.reindex(idx_window)
+    if window.isna().any():
+        raise ValueError("Insufficient history for requested lookback window.")
+    return window.values.astype(np.float32)
+
+
+def predict_xgb_vstf(models_h: List, df5: pd.DataFrame, t_now: pd.Timestamp, cfg: Dict) -> np.ndarray:
+    if not XGB_AVAILABLE:
+        raise ImportError("xgboost is required to run XGB models.")
+    step_minutes = int(cfg["step_minutes"])
+    lags = _lags_from_series(df5["p_norm"], t_now, step_minutes, cfg["lookback_steps"])
+
+    preds = []
+    for h, model_h in enumerate(models_h, start=1):
+        tgt_time = t_now + pd.Timedelta(minutes=step_minutes * h)
+        dow = float(tgt_time.dayofweek)
+        tod_min = float(tgt_time.hour * 60 + tgt_time.minute)
+        dow_ang = 2.0 * np.pi * dow / 7.0
+        tod_ang = 2.0 * np.pi * tod_min / (24.0 * 60.0)
+        feats = np.hstack([
+            lags,
+            [np.sin(dow_ang), np.cos(dow_ang), np.sin(tod_ang), np.cos(tod_ang)],
+        ]).reshape(1, -1)
+        preds.append(model_h.predict(feats)[0])
+        if len(preds) >= cfg["horizon_steps"]:
+            break
+    return np.array(preds, dtype=np.float32)
+
+
+def predict_xgb_hourly(models_h: List, dfH: pd.DataFrame, anchor_hour: pd.Timestamp, cfg: Dict) -> np.ndarray:
+    if not XGB_AVAILABLE:
+        raise ImportError("xgboost is required to run XGB models.")
+    lags = _lags_from_series(dfH["p_norm"], anchor_hour, 60, cfg["lookback_steps"])
+
+    preds = []
+    for h, model_h in enumerate(models_h, start=1):
+        tgt_time = pd.Timestamp(anchor_hour).floor("h") + pd.Timedelta(hours=h)
+        dow = float(tgt_time.dayofweek)
+        hod = float(tgt_time.hour)
+        dow_ang = 2.0 * np.pi * dow / 7.0
+        hod_ang = 2.0 * np.pi * hod / 24.0
+        feats = np.hstack([
+            lags,
+            [np.sin(dow_ang), np.cos(dow_ang), np.sin(hod_ang), np.cos(hod_ang)],
+        ]).reshape(1, -1)
+        preds.append(model_h.predict(feats)[0])
+        if len(preds) >= cfg["horizon_steps"]:
+            break
+    return np.array(preds, dtype=np.float32)
+
+
+def predict_vstf(bundle: Dict, df5: pd.DataFrame, t_now: pd.Timestamp) -> np.ndarray:
+    cfg = bundle["cfg"]
+    if bundle["backend"] == "xgb_direct":
+        return predict_xgb_vstf(bundle["model"], df5, t_now, cfg)
+    X_vstf = build_vstf_input(df5, t_now, lookback_steps=cfg["lookback_steps"])
+    return bundle["model"].predict(X_vstf, verbose=0).reshape(-1)
+
+
+def predict_hourly(bundle: Dict, dfH: pd.DataFrame, anchor_hour: pd.Timestamp) -> np.ndarray:
+    cfg = bundle["cfg"]
+    if bundle["backend"] == "xgb_direct":
+        return predict_xgb_hourly(bundle["model"], dfH, anchor_hour, cfg)
+    X_st = build_st_input_for_anchor(dfH, anchor_hour, lookback_steps=cfg["lookback_steps"])
+    return bundle["model"].predict(X_st, verbose=0).reshape(-1)
 
 # =========================
 # Interpolación & combinación
@@ -221,8 +365,8 @@ def forecast_combined_36h_5min(
     t_now: pd.Timestamp,
     df5: pd.DataFrame,
     dfH: pd.DataFrame,
-    model_vstf,
-    model_st,
+    model_vstf: Dict,
+    model_st: Dict,
     vstf_cfg: Dict,
     st_cfg: Dict,
     clamp_daylight: Optional[Tuple[str, str]] = None,
@@ -235,11 +379,11 @@ def forecast_combined_36h_5min(
     """
     assert vstf_cfg["step_minutes"] == 5
     assert st_cfg["step_minutes"] == 60
-    assert st_cfg["horizon_steps"] >= total_hours
+    if st_cfg["horizon_steps"] < total_hours:
+        raise ValueError("Hourly model horizon is shorter than requested total_hours.")
 
-    # VSTF
-    X_vstf = build_vstf_input(df5, t_now, lookback_steps=vstf_cfg["lookback_steps"])
-    vstf_pred = model_vstf.predict(X_vstf, verbose=0).reshape(-1)
+    # VSTF (5-min)
+    vstf_pred = predict_vstf(model_vstf, df5, t_now)
 
     # Cuántos pasos VSTF usar
     if use_vstf_full_horizon:
@@ -253,8 +397,7 @@ def forecast_combined_36h_5min(
         st_hourly = st_cache[next_full_hour]
     else:
         anchor_hour = next_full_hour - pd.Timedelta(hours=1)
-        X_st = build_st_input_for_anchor(dfH, anchor_hour, lookback_steps=st_cfg["lookback_steps"])
-        st_pred = model_st.predict(X_st, verbose=0).reshape(-1)[:st_cfg["horizon_steps"]]
+        st_pred = predict_hourly(model_st, dfH, anchor_hour)[: st_cfg["horizon_steps"]]
         st_times_hourly = pd.date_range(start=next_full_hour, periods=st_cfg["horizon_steps"], freq="h")
         st_hourly = pd.Series(st_pred, index=st_times_hourly)
         if clamp_daylight is not None:
@@ -346,7 +489,7 @@ def plot_overlay_both(samples: List[Dict], save_dir: str, fig_idx: int):
     plt.tight_layout()
     out_png = os.path.join(save_dir, f"debug_overlay_{fig_idx:04d}_{t_now.strftime('%Y%m%d_%H%M')}.png")
     plt.savefig(out_png, dpi=140)
-    plt.show()
+    plt.close()
 
 # =========================
 # Main simulation
@@ -355,7 +498,7 @@ def main():
     # ---------- LOAD ----------
     dfl = pd.read_csv(LOAD_TEST_CSV, parse_dates=["timestamp"]).sort_values("timestamp").set_index("timestamp")
     if "p_norm" not in dfl.columns:
-        raise ValueError("LOAD CSV debe contener 'p_norm'.")
+        raise ValueError("LOAD CSV must contain 'p_norm'.")
     dfl5 = add_cyclical_features_5min(dfl[["p_norm"]].copy())
 
     if TRAIN_RESAMPLE_AGG == "mean":
@@ -365,13 +508,13 @@ def main():
     elif TRAIN_RESAMPLE_AGG == "sum":
         dflH = dfl[["p_norm"]].resample("h").sum(numeric_only=True).dropna()
     else:
-        raise ValueError("TRAIN_RESAMPLE_AGG no soportado.")
+        raise ValueError("TRAIN_RESAMPLE_AGG not supported.")
     dflH = add_cyclical_features_hourly(dflH)
 
     # ---------- PV ----------
     dfp_raw = pd.read_csv(PV_TEST_CSV, parse_dates=["timestamp"]).sort_values("timestamp").set_index("timestamp")
     if "p_norm" not in dfp_raw.columns:
-        raise ValueError("PV CSV debe contener 'p_norm'.")
+        raise ValueError("PV CSV must contain 'p_norm'.")
     dfp = enforce_pv_zero_outside_window(dfp_raw[["p_norm"]], DAY_START, DAY_END)
     dfp5 = add_cyclical_features_5min(dfp.copy())
 
@@ -382,38 +525,25 @@ def main():
     elif TRAIN_RESAMPLE_AGG == "sum":
         dfpH = dfp[["p_norm"]].resample("h").sum(numeric_only=True).dropna()
     else:
-        raise ValueError("TRAIN_RESAMPLE_AGG no soportado.")
+        raise ValueError("TRAIN_RESAMPLE_AGG not supported.")
     dfpH = add_cyclical_features_hourly(dfpH)
 
-    # ---------- Rutas de modelos ----------
-    load_vstf_path = resolve_existing_path(
-        _candidates_vstf("load", LOAD_VSTF_DEFAULT["step_minutes"],
-                         LOAD_VSTF_DEFAULT["horizon_steps"]*LOAD_VSTF_DEFAULT["step_minutes"],
-                         LOAD_VSTF_DEFAULT["lookback_steps"])
-    )
-    load_st_path   = _path_hourly("load", LOAD_ST_DEFAULT["horizon_steps"], LOAD_ST_DEFAULT["lookback_steps"])
-    if not os.path.exists(load_st_path):
-        raise FileNotFoundError(load_st_path)
+    # ---------- Model paths (prefer XGBoost, fallback to LSTM) ----------
+    load_vstf_path = resolve_existing_path(LOAD_VSTF_CANDIDATES)
+    load_st_path   = resolve_existing_path(LOAD_ST_CANDIDATES)
+    pv_vstf_path   = resolve_existing_path(PV_VSTF_CANDIDATES)
+    pv_st_path     = resolve_existing_path(PV_ST_CANDIDATES)
 
-    pv_vstf_path = resolve_existing_path(
-        _candidates_vstf("pv", PV_VSTF_DEFAULT["step_minutes"],
-                         PV_VSTF_DEFAULT["horizon_steps"]*PV_VSTF_DEFAULT["step_minutes"],
-                         PV_VSTF_DEFAULT["lookback_steps"])
-    )
-    pv_st_path   = _path_hourly("pv", PV_ST_DEFAULT["horizon_steps"], PV_ST_DEFAULT["lookback_steps"])
-    if not os.path.exists(pv_st_path):
-        raise FileNotFoundError(pv_st_path)
+    # ---------- Load models & configs ----------
+    m_vstf_load = load_model_bundle(load_vstf_path, LOAD_VSTF_DEFAULT)
+    m_st_load   = load_model_bundle(load_st_path,   LOAD_ST_DEFAULT)
+    m_vstf_pv   = load_model_bundle(pv_vstf_path,   PV_VSTF_DEFAULT)
+    m_st_pv     = load_model_bundle(pv_st_path,     PV_ST_DEFAULT)
 
-    # ---------- Carga modelos & configs ----------
-    m_vstf_load = load_keras_safely(load_vstf_path)
-    m_st_load   = load_keras_safely(load_st_path)
-    m_vstf_pv   = load_keras_safely(pv_vstf_path)
-    m_st_pv     = load_keras_safely(pv_st_path)
-
-    vstf_cfg_load = get_model_cfg(load_vstf_path, LOAD_VSTF_DEFAULT)
-    st_cfg_load   = get_model_cfg(load_st_path,   LOAD_ST_DEFAULT)
-    vstf_cfg_pv   = get_model_cfg(pv_vstf_path,   PV_VSTF_DEFAULT)
-    st_cfg_pv     = get_model_cfg(pv_st_path,     PV_ST_DEFAULT)
+    vstf_cfg_load = m_vstf_load["cfg"]
+    st_cfg_load   = m_st_load["cfg"]
+    vstf_cfg_pv   = m_vstf_pv["cfg"]
+    st_cfg_pv     = m_st_pv["cfg"]
 
     # ---------- Rango de simulación ----------
     last_idx_common   = min(dfl5.index.max(), dfp5.index.max())
@@ -438,15 +568,17 @@ def main():
     t_stop_by_days = t_start + pd.Timedelta(days=STOP_AFTER_DAYS)
     t_stop         = min(t_stop_by_horizon, t_stop_by_days)
     if t_stop <= t_start:
-        raise ValueError("Span de test insuficiente. Ajusta parámetros de inicio/ventana.")
+        raise ValueError("Insufficient test span. Adjust start/window parameters.")
 
     step_delta = pd.Timedelta(minutes=5 * SIM_ADVANCE_STEPS)
     total_minutes = int((t_stop - t_start).total_seconds() // 60)
     est_iters = total_minutes // (5 * SIM_ADVANCE_STEPS) + 1
-    print(f"Simulando de {t_start} a {t_stop} cada {SIM_ADVANCE_STEPS*5} min "
-          f"(~{est_iters} iter)… [debug={'on' if DEBUG_ENABLED else 'off'}, "
-          f"plot_every={DEBUG_PLOT_EVERY}, show_last_k={DEBUG_SHOW_LAST_K}, "
-          f"use_vstf_full_horizon={USE_VSTF_FULL_HORIZON}]")
+    print(
+        f"Simulating from {t_start} to {t_stop} every {SIM_ADVANCE_STEPS*5} min "
+        f"(~{est_iters} iters) [debug={'on' if DEBUG_ENABLED else 'off'}, "
+        f"plot_every={DEBUG_PLOT_EVERY}, show_last_k={DEBUG_SHOW_LAST_K}, "
+        f"use_vstf_full_horizon={USE_VSTF_FULL_HORIZON}]"
+    )
 
     # ---------- Loop ----------
     st_cache_load: Dict[pd.Timestamp, pd.Series] = {}
@@ -487,7 +619,7 @@ def main():
             st5_pv  = st5_pv.clip(lower=0.0)
 
         except Exception as e:
-            print(f"[WARN] Consulta @ {cur} falló: {e}")
+            print(f"[WARN] Query @ {cur} failed: {e}")
             cur += step_delta
             qcount += 1
             continue
