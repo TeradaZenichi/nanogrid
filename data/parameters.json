@@ -18,7 +18,7 @@
     }
   },
   "EDS": {
-    "outage_probability_pct": 50,
+    "outage_probability_pct": 10,
     "outage_duration_std_dev_frac": 1.0,
     "outage_duration_hours": 2,
     "Pmax": 2,
