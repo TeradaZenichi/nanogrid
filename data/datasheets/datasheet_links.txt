@@ -1,0 +1,9 @@
+Dyness Powerbox Pro (EN) datasheet:
+https://dyness.com/Public/Uploads/uploadfile/files/20241015/DynessPowerboxProdatasheetEN.pdf
+
+BYD Battery-Box Premium HVS/HVM (EN) datasheet:
+https://www.bydbatterybox.com/uploads/downloads/230530_BYD_Battery-Box_Premium_HVS%26HVM_Datasheet_V1.7_EN-647eedf90f9c3.pdf
+
+Cost references (BESS replacement / market benchmark):
+https://www.energysage.com/local-data/energy-storage-cost/ar/
+https://atb.nrel.gov/electricity/2023/2023/residential_battery_storage

@@ -1,0 +1,156 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=2.2cm}
+
+\title{Sizing Estocastico -- Modelo em \texttt{sizing/\_\_init\_\_.py}}
+\author{Nanogrid}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Objetivo}
+Este documento resume o modelo de \emph{sizing} implementado em
+\texttt{sizing/\_\_init\_\_.py}. O problema escolhe o tamanho de PV e BESS
+para minimizar CAPEX + OPEX em valor presente (NPV), considerando cenarios
+de demanda/geracao e contingencias de falha da EDS.
+
+\section{Conjuntos e indices}
+\begin{align}
+t &\in \Omega_t && \text{(slots de tempo)}\\
+s &\in \Omega_s && \text{(cenarios de demanda/geracao)}\\
+c &\in \Omega_c && \text{(contingencias, com } c0 \text{ como caso base)}
+\end{align}
+
+\section{Variaveis de sizing}
+\begin{align}
+\hat{P}^{\text{PV}} &\ge 0 \\
+\hat{E}^{\text{BESS}} &\ge 0
+\end{align}
+
+\section{Variaveis operacionais}
+\begin{align}
+P_{t,s,c}^{\text{BESS,c}},\;
+P_{t,s,c}^{\text{BESS,d}},\;
+E_{t,s,c}^{\text{BESS}},\;
+P_{t,s,c}^{\text{EDS,in}},\;
+P_{t,s,c}^{\text{EDS,out}},\;
+P_{t,s,c}^{\text{PV,curt}},\;
+P_{t,s,c}^{\text{L,shed}}
+\end{align}
+com binarias de modo:
+\begin{align}
+\gamma_{t,s,c}^{\text{BESS,c}},\;
+\gamma_{t,s,c}^{\text{BESS,d}} \in \{0,1\}.
+\end{align}
+
+\section{Perfis normalizados}
+\begin{align}
+P_{t,s}^{\text{L}} &= f_{t,s}^{\text{L}}\;\overline{P}^{\text{D}}\\
+P_{t,s}^{\text{PV,avail}} &= f_{t,s}^{\text{PV}}\;\hat{P}^{\text{PV}}
+\end{align}
+
+\section{Restricoes}
+\subsection*{Balanco de potencia}
+\begin{align}
+\left(P_{t,s}^{\text{PV,avail}} - P_{t,s,c}^{\text{PV,curt}}\right)
++ P_{t,s,c}^{\text{BESS,d}} - P_{t,s,c}^{\text{BESS,c}}
++ P_{t,s,c}^{\text{EDS,in}} - P_{t,s,c}^{\text{EDS,out}}
+= P_{t,s}^{\text{L}} - P_{t,s,c}^{\text{L,shed}}.
+\end{align}
+
+\subsection*{Dinamica da BESS}
+\begin{align}
+E_{t+1,s,c}^{\text{BESS}} &=
+E_{t,s,c}^{\text{BESS}} +
+\Delta t_t\left(
+\eta^{\text{BESS,c}} P_{t,s,c}^{\text{BESS,c}}
+- \frac{1}{\eta^{\text{BESS,d}}} P_{t,s,c}^{\text{BESS,d}}
+\right).
+\end{align}
+
+\subsection*{Exclusividade carga/descarga}
+\begin{align}
+\gamma_{t,s,c}^{\text{BESS,c}} + \gamma_{t,s,c}^{\text{BESS,d}} \le 1.
+\end{align}
+
+\subsection*{Limites da BESS (C-rate simetrico)}
+\begin{align}
+0 \le P_{t,s,c}^{\text{BESS,c}} &\le \kappa^{\text{BESS}}\hat{E}^{\text{BESS}}\\
+0 \le P_{t,s,c}^{\text{BESS,d}} &\le \kappa^{\text{BESS}}\hat{E}^{\text{BESS}}\\
+P_{t,s,c}^{\text{BESS,c}} &\le \kappa^{\text{BESS}}E_{\max}^{\text{BESS}}\gamma_{t,s,c}^{\text{BESS,c}}\\
+P_{t,s,c}^{\text{BESS,d}} &\le \kappa^{\text{BESS}}E_{\max}^{\text{BESS}}\gamma_{t,s,c}^{\text{BESS,d}}\\
+(1-\text{DoD}^{\text{BESS}})\hat{E}^{\text{BESS}} &\le E_{t,s,c}^{\text{BESS}} \le \hat{E}^{\text{BESS}}.
+\end{align}
+
+\subsection*{Curtailment e shed}
+\begin{align}
+0 \le P_{t,s,c}^{\text{PV,curt}} &\le P_{t,s}^{\text{PV,avail}}\\
+0 \le P_{t,s,c}^{\text{L,shed}} &\le P_{t,s}^{\text{L}}.
+\end{align}
+
+\subsection*{Limites EDS e contingencia}
+\begin{align}
+0 \le P_{t,s,c}^{\text{EDS,in}} &\le \overline{P}^{\text{EDS,in}}\\
+0 \le P_{t,s,c}^{\text{EDS,out}} &\le \overline{P}^{\text{EDS,out}}
+\end{align}
+e, para \(c \neq c0\), na janela de falha \(W(c)\):
+\begin{align}
+P_{t,s,c}^{\text{EDS,in}} = 0,\qquad
+P_{t,s,c}^{\text{EDS,out}} = 0.
+\end{align}
+
+\subsection*{Nao antecipatividade}
+Antes da contingencia (\(t \in \text{Before}(c)\)), as decisoes do cenario
+contingente devem coincidir com o caso base \(c0\).
+
+\section{Funcao objetivo}
+\subsection*{CAPEX}
+\begin{align}
+\text{CAPEX} =
+C^{\text{PV,capex}}\hat{P}^{\text{PV}} +
+C^{\text{BESS,capex}}\hat{E}^{\text{BESS}}.
+\end{align}
+
+\subsection*{OPEX diario esperado}
+\begin{align}
+\text{OPEX}_{\text{day}} =
+\sum_{s \in \Omega_s}\sum_{c \in \Omega_c}\pi_s\pi_c
+\sum_{t \in \Omega_t}\Delta t_t \Big(
+c_t^{\text{EDS}}P_{t,s,c}^{\text{EDS,in}}
++ c^{\text{L,shed}}P_{t,s,c}^{\text{L,shed}}
++ c^{\text{PV,curt}}P_{t,s,c}^{\text{PV,curt}}
++ c^{\text{BESS,deg}}\big(P_{t,s,c}^{\text{BESS,c}} + P_{t,s,c}^{\text{BESS,d}}\big)
+\Big).
+\end{align}
+
+\subsection*{NPV do OPEX}
+\begin{align}
+\text{OPEX}_{\text{annual}} &= N_{\text{days}}\cdot\text{OPEX}_{\text{day}}\\
+\text{NPV}^{\text{OPEX}} &= \sum_{y=1}^{N_Y}\frac{\text{OPEX}_{\text{annual}}}{(1+r)^y}.
+\end{align}
+
+\subsection*{Problema final}
+\begin{align}
+\min\; \text{CAPEX} + \text{NPV}^{\text{OPEX}}.
+\end{align}
+
+\section{Entradas principais}
+\begin{itemize}
+\item \texttt{data/parameters.json}
+\item \texttt{data/sizing/prototypes\_load\_dtw\_all\_train.csv}
+\item \texttt{data/sizing/prototypes\_pv\_dtw\_train.csv}
+\item \texttt{data/sizing/prob\_joint\_load\_pv.csv}
+\end{itemize}
+
+\section{Execucao}
+Script principal atual:
+\begin{itemize}
+\item \texttt{1-main\_sizing.py}
+\end{itemize}
+
+\end{document}

@@ -161,6 +161,27 @@ class Parameters:
         self.npv_years = int(self.sizing_cfg.get("npv_years", 10))
         self.discount_rate = float(self.sizing_cfg.get("discount_rate", 0.08))
         self.days_per_year = float(self.sizing_cfg.get("days_per_year", 365.0))
+        self.bess_calendar_fade_per_year = float(
+            self.sizing_cfg.get(
+                "bess_calendar_fade_per_year",
+                self.bess_cfg.get("calendar_fade_per_year", 0.0),
+            )
+        )
+        self.bess_eol_capacity_frac = float(
+            self.sizing_cfg.get(
+                "bess_eol_capacity_frac",
+                self.bess_cfg.get("eol_capacity_frac", 0.8),
+            )
+        )
+        self.bess_eol_capacity_frac = min(max(self.bess_eol_capacity_frac, 0.0), 1.0)
+        if "bess_cyclic_fade_per_kwh" in self.sizing_cfg:
+            self.bess_cyclic_fade_per_kwh = float(self.sizing_cfg["bess_cyclic_fade_per_kwh"])
+        else:
+            cycle_life = float(self.bess_cfg.get("cycle_life_full", 0.0))
+            if cycle_life > 0.0:
+                self.bess_cyclic_fade_per_kwh = (1.0 - self.bess_eol_capacity_frac) / (2.0 * cycle_life)
+            else:
+                self.bess_cyclic_fade_per_kwh = 0.0
 
         self.default_split = str(self.sizing_cfg.get("split", "train"))
         self.max_time_slots = self.sizing_cfg.get("max_time_slots")
@@ -250,6 +271,9 @@ class Parameters:
 
         model.days_per_year = pyo.Param(initialize=self.days_per_year)
         model.discount_rate = pyo.Param(initialize=max(0.0, self.discount_rate))
+        model.alpha_BESS_cal = pyo.Param(initialize=max(0.0, self.bess_calendar_fade_per_year))
+        model.alpha_BESS_cyc = pyo.Param(initialize=max(0.0, self.bess_cyclic_fade_per_kwh))
+        model.E_BESS_EOL_frac = pyo.Param(initialize=self.bess_eol_capacity_frac)
 
 
 class Load:
@@ -349,6 +373,8 @@ class BESS:
             domain=pyo.NonNegativeReals,
             bounds=(0.0, max(0.0, self.param.bess_size_max_kwh)),
         )
+        model.E_BESS_year = pyo.Var(model.Y, domain=pyo.NonNegativeReals)
+        model.E_BESS_min_life = pyo.Var(domain=pyo.NonNegativeReals)
 
         model.P_BESS_c = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
         model.P_BESS_d = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
@@ -374,7 +400,7 @@ class BESS:
         model.BESSInit = pyo.Constraint(
             model.S,
             model.C,
-            rule=lambda m, s, c: m.E_BESS[first_t, s, c] == m.E_init_frac * m.E_hat_BESS,
+            rule=lambda m, s, c: m.E_BESS[first_t, s, c] == m.E_init_frac * m.E_BESS_min_life,
         )
 
         model.BESSMode = pyo.Constraint(
@@ -384,17 +410,53 @@ class BESS:
             rule=lambda m, t, s, c: m.gamma_BESS_c[t, s, c] + m.gamma_BESS_d[t, s, c] <= 1,
         )
 
+        model.BESSThroughputDay = pyo.Expression(
+            expr=sum(
+                model.pi_s[s]
+                * model.pi_c[c]
+                * model.dt_h[t]
+                * (model.P_BESS_c[t, s, c] + model.P_BESS_d[t, s, c])
+                for t in model.T
+                for s in model.S
+                for c in model.C
+            )
+        )
+
+        first_y = model.Y.first()
+        model.BESSYearInit = pyo.Constraint(expr=model.E_BESS_year[first_y] == model.E_hat_BESS)
+        model.BESSYearFade = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: (
+                m.E_BESS_year[m.Y.next(y)]
+                == m.E_BESS_year[y]
+                - m.alpha_BESS_cal * m.E_BESS_year[y]
+                - m.alpha_BESS_cyc * m.days_per_year * m.BESSThroughputDay
+            )
+            if y != m.Y.last()
+            else pyo.Constraint.Skip,
+        )
+        model.BESSYearEOL = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: m.E_BESS_year[y] >= m.E_BESS_EOL_frac * m.E_hat_BESS,
+        )
+        model.BESSMinLifeUpper = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: m.E_BESS_min_life <= m.E_BESS_year[y],
+        )
+        model.BESSMinLifeLower = pyo.Constraint(expr=model.E_BESS_min_life >= model.E_BESS_EOL_frac * model.E_hat_BESS)
+        model.BESSMinLifeCap = pyo.Constraint(expr=model.E_BESS_min_life <= model.E_hat_BESS)
+
         model.BESSChargeCRate = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_BESS_c[t, s, c] <= m.kappa_BESS * m.E_hat_BESS,
+            rule=lambda m, t, s, c: m.P_BESS_c[t, s, c] <= m.kappa_BESS * m.E_BESS_min_life,
         )
         model.BESSDischargeCRate = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_BESS_d[t, s, c] <= m.kappa_BESS * m.E_hat_BESS,
+            rule=lambda m, t, s, c: m.P_BESS_d[t, s, c] <= m.kappa_BESS * m.E_BESS_min_life,
         )
         model.BESSChargeMode = pyo.Constraint(
             model.T,
@@ -415,13 +477,13 @@ class BESS:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.E_BESS[t, s, c] >= (1.0 - m.DoD_BESS) * m.E_hat_BESS,
+            rule=lambda m, t, s, c: m.E_BESS[t, s, c] >= (1.0 - m.DoD_BESS) * m.E_BESS_min_life,
         )
         model.BESSSoCHi = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.E_BESS[t, s, c] <= m.E_hat_BESS,
+            rule=lambda m, t, s, c: m.E_BESS[t, s, c] <= m.E_BESS_min_life,
         )
 
 
@@ -699,9 +761,13 @@ class MicrogridDesign:
             "slots": bundle["slots"],
             "scenarios": bundle["scenarios"],
             "contingencies": bundle["contingencies"],
+            "years": list(self.model.Y.data()),
             "dt_h": bundle["dt_h"],
             "cluster_load_of_s": bundle["cluster_load_of_s"],
             "cluster_pv_of_s": bundle["cluster_pv_of_s"],
+            "alpha_BESS_cal": self.param.bess_calendar_fade_per_year,
+            "alpha_BESS_cyc": self.param.bess_cyclic_fade_per_kwh,
+            "E_BESS_EOL_frac": self.param.bess_eol_capacity_frac,
         }
         return m
 
@@ -726,6 +792,8 @@ class MicrogridDesign:
         return {
             "P_hat_PV_kw": _safe(m.P_hat_PV),
             "E_hat_BESS_kwh": _safe(m.E_hat_BESS),
+            "E_BESS_min_life_kwh": _safe(m.E_BESS_min_life),
+            "E_BESS_year_kwh": {int(y): _safe(m.E_BESS_year[y]) for y in m.Y},
             "CAPEX": _safe(m.CAPEX),
             "OPEX_day": _safe(m.OPEX_day),
             "OPEX_annual": _safe(m.OPEX_annual),
