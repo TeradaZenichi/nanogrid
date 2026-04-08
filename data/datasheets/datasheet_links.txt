@@ -1,9 +1,26 @@
-Dyness Powerbox Pro (EN) datasheet:
+Local files in this folder (data/datasheets):
+- Dyness_Powerbox_Pro_datasheet_EN.pdf
+- BYD_Battery_Box_Premium_HVS_HVM_Datasheet_V1.7_EN.pdf
+- PV_Trina_VertexS_NEG9R25_datasheet.pdf
+- PV_Jinko_TR_JKM375-395N-6RL3_datasheet.pdf
+
+Datasheet source links:
+Dyness Powerbox Pro (EN):
 https://dyness.com/Public/Uploads/uploadfile/files/20241015/DynessPowerboxProdatasheetEN.pdf
 
-BYD Battery-Box Premium HVS/HVM (EN) datasheet:
+BYD Battery-Box Premium HVS/HVM (EN):
 https://www.bydbatterybox.com/uploads/downloads/230530_BYD_Battery-Box_Premium_HVS%26HVM_Datasheet_V1.7_EN-647eedf90f9c3.pdf
+
+Trina Vertex S+ (PV module):
+https://vertexsplus.trinasolar.com/wp-content/uploads/2024/04/Datasheet_Vertex-S_NEG9R.25_EN_2024_PA_web-1.pdf
+
+Jinko Tiger Neo (TR JKM375-395N-6RL3):
+https://www.jinkosolar.com/uploads/5fbb8f5f/TR-JKM375-395N-6RL3-A1-EN.pdf
 
 Cost references (BESS replacement / market benchmark):
 https://www.energysage.com/local-data/energy-storage-cost/ar/
 https://atb.nrel.gov/electricity/2023/2023/residential_battery_storage
+
+Cost references (PV CAPEX benchmark used in sizing):
+https://www.energy.gov/cmei/systems/solar-photovoltaic-system-cost-benchmarks
+https://www.nrel.gov/solar/market-research-analysis/solar-installed-system-cost.html

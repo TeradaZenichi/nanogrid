@@ -48,10 +48,19 @@
   "cycle_life_full": 6000           
   },
   "PV": {
-    "Pmax_kw": 2.5
+    "Pmax_kw": 2.5,
+    "capex_per_kw": 2740.0,
+    "capex_reference": "DOE/SETO PV benchmark (2024Q1), Residential PV MSP = 2.74 USD/Wdc"
   },
   "Load": {
     "Pmax_kw": 5.0
+  },
+  "sizing": {
+    "contingency_step_slots": 4,
+    "bess_calendar_fade_per_year": 0.0,
+    "pv_degradation_year1_frac": 0.01,
+    "pv_degradation_linear_frac": 0.004,
+    "pv_degradation_reference": "Trina Vertex S+ datasheet: first year <=1%, annual linear <=0.4%"
   },
   "profiles": {
     "fL": [0.8],

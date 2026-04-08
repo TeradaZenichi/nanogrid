@@ -130,9 +130,12 @@ class Parameters:
         self.p_eds_in_max_kw = float(self.eds_cfg.get("Pmax", self.eds_cfg.get("Pmax_kw", 0.0)))
         self.p_eds_out_max_kw = float(abs(self.eds_cfg.get("Pmin", self.eds_cfg.get("Pmin_kw", 0.0))))
 
-        self.pv_size_max_kw = float(
-            self.sizing_cfg.get("P_PV_size_max_kw", self.pv_cfg.get("Pmax_kw", 0.0))
-        )
+        pv_size_cap_raw = self.sizing_cfg.get("P_PV_size_max_kw", None)
+        if pv_size_cap_raw is None:
+            self.pv_size_max_kw = None
+        else:
+            pv_cap = float(pv_size_cap_raw)
+            self.pv_size_max_kw = pv_cap if pv_cap > 0.0 else None
         self.bess_size_max_kwh = float(
             self.sizing_cfg.get("E_BESS_size_max_kwh", self.bess_cfg.get("Emax_kwh", 0.0))
         )
@@ -183,6 +186,22 @@ class Parameters:
             else:
                 self.bess_cyclic_fade_per_kwh = 0.0
 
+        # PV degradation (datasheet-style): first-year drop + linear annual drop.
+        self.pv_degradation_year1_frac = float(
+            self.sizing_cfg.get(
+                "pv_degradation_year1_frac",
+                self.pv_cfg.get("degradation_year1_frac", 0.01),
+            )
+        )
+        self.pv_degradation_linear_frac = float(
+            self.sizing_cfg.get(
+                "pv_degradation_linear_frac",
+                self.pv_cfg.get("degradation_linear_frac", 0.004),
+            )
+        )
+        self.pv_degradation_year1_frac = min(max(self.pv_degradation_year1_frac, 0.0), 1.0)
+        self.pv_degradation_linear_frac = min(max(self.pv_degradation_linear_frac, 0.0), 1.0)
+
         self.default_split = str(self.sizing_cfg.get("split", "train"))
         self.max_time_slots = self.sizing_cfg.get("max_time_slots")
         self.include_zero_prob_scenarios = bool(self.sizing_cfg.get("include_zero_prob_scenarios", True))
@@ -190,6 +209,13 @@ class Parameters:
     def c_eds_at_slot(self, slot: int, dt_h: float) -> float:
         hour = int((slot * dt_h) % 24)
         return float(self.tou_map.get(f"{hour:02d}:00", 0.0))
+
+    def pv_retention_factor(self, year: int) -> float:
+        y = max(1, int(year))
+        if y == 1:
+            return 1.0
+        factor = (1.0 - self.pv_degradation_year1_frac) * ((1.0 - self.pv_degradation_linear_frac) ** (y - 1))
+        return max(0.0, float(factor))
 
     def build_contingencies(self, slots: list[int], dt_h: float) -> dict[str, Any]:
         contingencies = ["c0"]
@@ -274,6 +300,9 @@ class Parameters:
         model.alpha_BESS_cal = pyo.Param(initialize=max(0.0, self.bess_calendar_fade_per_year))
         model.alpha_BESS_cyc = pyo.Param(initialize=max(0.0, self.bess_cyclic_fade_per_kwh))
         model.E_BESS_EOL_frac = pyo.Param(initialize=self.bess_eol_capacity_frac)
+        model.alpha_PV_year1 = pyo.Param(initialize=max(0.0, self.pv_degradation_year1_frac))
+        model.alpha_PV_linear = pyo.Param(initialize=max(0.0, self.pv_degradation_linear_frac))
+        model.d_PV_y = pyo.Param(model.Y, initialize=lambda _, y: self.pv_retention_factor(int(y)))
 
 
 class Load:
@@ -288,13 +317,14 @@ class Load:
             initialize=lambda _, t, s: float(bundle["f_load"][(int(t), str(s))]),
         )
         model.P_L = pyo.Expression(model.T, model.S, rule=lambda m, t, s: m.f_L[t, s] * m.P_D_bar)
-        model.P_L_shed = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
+        model.P_L_shed = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
 
         model.LoadShedHi = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_L_shed[t, s, c] <= m.P_L[t, s],
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_L_shed[t, s, c, y] <= m.P_L[t, s],
         )
 
 
@@ -309,18 +339,25 @@ class PV:
             model.S,
             initialize=lambda _, t, s: float(bundle["f_pv"][(int(t), str(s))]),
         )
+        pv_ub = None if self.param.pv_size_max_kw is None else max(0.0, self.param.pv_size_max_kw)
         model.P_hat_PV = pyo.Var(
             domain=pyo.NonNegativeReals,
-            bounds=(0.0, max(0.0, self.param.pv_size_max_kw)),
+            bounds=(0.0, pv_ub),
         )
-        model.P_PV_avail = pyo.Expression(model.T, model.S, rule=lambda m, t, s: m.f_PV[t, s] * m.P_hat_PV)
-        model.P_PV_curt = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
+        model.P_PV_avail = pyo.Expression(
+            model.T,
+            model.S,
+            model.Y,
+            rule=lambda m, t, s, y: m.f_PV[t, s] * m.P_hat_PV * m.d_PV_y[y],
+        )
+        model.P_PV_curt = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
 
         model.PVCurtailHi = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_PV_curt[t, s, c] <= m.P_PV_avail[t, s],
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_PV_curt[t, s, c, y] <= m.P_PV_avail[t, s, y],
         )
 
 
@@ -330,26 +367,29 @@ class Grid:
         self.param = parameters
 
     def build(self, model: pyo.ConcreteModel) -> None:
-        model.P_EDS_in = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
-        model.P_EDS_out = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
+        model.P_EDS_in = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
+        model.P_EDS_out = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
 
         model.EDSImportCap = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_EDS_in[t, s, c] <= m.P_EDS_in_max,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_EDS_in[t, s, c, y] <= m.P_EDS_in_max,
         )
         model.EDSExportCap = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_EDS_out[t, s, c] <= m.P_EDS_out_max,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_EDS_out[t, s, c, y] <= m.P_EDS_out_max,
         )
         model.EDSOutageImportZero = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_EDS_in[t, s, c] == 0.0)
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_EDS_in[t, s, c, y] == 0.0)
             if (c != "c0" and t in m.W[c])
             else pyo.Constraint.Skip,
         )
@@ -357,7 +397,8 @@ class Grid:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_EDS_out[t, s, c] == 0.0)
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_EDS_out[t, s, c, y] == 0.0)
             if (c != "c0" and t in m.W[c])
             else pyo.Constraint.Skip,
         )
@@ -376,12 +417,9 @@ class BESS:
         model.E_BESS_year = pyo.Var(model.Y, domain=pyo.NonNegativeReals)
         model.E_BESS_min_life = pyo.Var(domain=pyo.NonNegativeReals)
 
-        model.P_BESS_c = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
-        model.P_BESS_d = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
-        model.E_BESS = pyo.Var(model.T, model.S, model.C, domain=pyo.NonNegativeReals)
-
-        model.gamma_BESS_c = pyo.Var(model.T, model.S, model.C, domain=pyo.Binary)
-        model.gamma_BESS_d = pyo.Var(model.T, model.S, model.C, domain=pyo.Binary)
+        model.P_BESS_c = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
+        model.P_BESS_d = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
+        model.E_BESS = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
 
         first_t = model.T.first()
 
@@ -389,37 +427,33 @@ class BESS:
             model.TRANS,
             model.S,
             model.C,
-            rule=lambda m, t0, t1, s, c: m.E_BESS[t1, s, c]
-            == m.E_BESS[t0, s, c]
+            model.Y,
+            rule=lambda m, t0, t1, s, c, y: m.E_BESS[t1, s, c, y]
+            == m.E_BESS[t0, s, c, y]
             + m.dt_h[t0]
             * (
-                m.eta_BESS_c * m.P_BESS_c[t0, s, c]
-                - (1.0 / m.eta_BESS_d) * m.P_BESS_d[t0, s, c]
+                m.eta_BESS_c * m.P_BESS_c[t0, s, c, y]
+                - (1.0 / m.eta_BESS_d) * m.P_BESS_d[t0, s, c, y]
             ),
         )
         model.BESSInit = pyo.Constraint(
             model.S,
             model.C,
-            rule=lambda m, s, c: m.E_BESS[first_t, s, c] == m.E_init_frac * m.E_BESS_min_life,
-        )
-
-        model.BESSMode = pyo.Constraint(
-            model.T,
-            model.S,
-            model.C,
-            rule=lambda m, t, s, c: m.gamma_BESS_c[t, s, c] + m.gamma_BESS_d[t, s, c] <= 1,
+            model.Y,
+            rule=lambda m, s, c, y: m.E_BESS[first_t, s, c, y] == m.E_init_frac * m.E_BESS_year[y],
         )
 
         model.BESSThroughputDay = pyo.Expression(
-            expr=sum(
-                model.pi_s[s]
-                * model.pi_c[c]
-                * model.dt_h[t]
-                * (model.P_BESS_c[t, s, c] + model.P_BESS_d[t, s, c])
-                for t in model.T
-                for s in model.S
-                for c in model.C
-            )
+            model.Y,
+            rule=lambda m, y: sum(
+                m.pi_s[s]
+                * m.pi_c[c]
+                * m.dt_h[t]
+                * (m.P_BESS_c[t, s, c, y] + m.P_BESS_d[t, s, c, y])
+                for t in m.T
+                for s in m.S
+                for c in m.C
+            ),
         )
 
         first_y = model.Y.first()
@@ -430,7 +464,7 @@ class BESS:
                 m.E_BESS_year[m.Y.next(y)]
                 == m.E_BESS_year[y]
                 - m.alpha_BESS_cal * m.E_BESS_year[y]
-                - m.alpha_BESS_cyc * m.days_per_year * m.BESSThroughputDay
+                - m.alpha_BESS_cyc * m.days_per_year * m.BESSThroughputDay[y]
             )
             if y != m.Y.last()
             else pyo.Constraint.Skip,
@@ -450,40 +484,57 @@ class BESS:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_BESS_c[t, s, c] <= m.kappa_BESS * m.E_BESS_min_life,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_BESS_c[t, s, c, y] <= m.kappa_BESS * m.E_BESS_year[y],
         )
         model.BESSDischargeCRate = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_BESS_d[t, s, c] <= m.kappa_BESS * m.E_BESS_min_life,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_BESS_d[t, s, c, y] <= m.kappa_BESS * m.E_BESS_year[y],
         )
-        model.BESSChargeMode = pyo.Constraint(
+        # Extended relaxed formulation (Pozo et al., Extn-LP):
+        # avoids charge/discharge binaries by coupling p^c and p^d through
+        # energy-dependent and affine power constraints.
+        model.BESSChargeByEnergy = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_BESS_c[t, s, c]
-            <= m.kappa_BESS * max(0.0, self.param.bess_size_max_kwh) * m.gamma_BESS_c[t, s, c],
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_BESS_c[t, s, c, y]
+            <= (m.E_BESS_year[y] - m.E_BESS[t, s, c, y]) / (m.eta_BESS_c * m.dt_h[t]),
         )
-        model.BESSDischargeMode = pyo.Constraint(
+        model.BESSDischargeByEnergy = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.P_BESS_d[t, s, c]
-            <= m.kappa_BESS * max(0.0, self.param.bess_size_max_kwh) * m.gamma_BESS_d[t, s, c],
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_BESS_d[t, s, c, y]
+            <= (m.eta_BESS_d * (m.E_BESS[t, s, c, y] - (1.0 - m.DoD_BESS) * m.E_BESS_year[y])) / m.dt_h[t],
+        )
+        model.BESSRelaxCoupling = pyo.Constraint(
+            model.T,
+            model.S,
+            model.C,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.P_BESS_d[t, s, c, y]
+            <= (m.kappa_BESS * m.E_BESS_year[y]) - m.P_BESS_c[t, s, c, y],
         )
 
         model.BESSSoCLo = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.E_BESS[t, s, c] >= (1.0 - m.DoD_BESS) * m.E_BESS_min_life,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.E_BESS[t, s, c, y] >= (1.0 - m.DoD_BESS) * m.E_BESS_year[y],
         )
         model.BESSSoCHi = pyo.Constraint(
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: m.E_BESS[t, s, c] <= m.E_BESS_min_life,
+            model.Y,
+            rule=lambda m, t, s, c, y: m.E_BESS[t, s, c, y] <= m.E_BESS_year[y],
         )
 
 
@@ -637,7 +688,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_BESS_c[t, s, c] == m.P_BESS_c[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_BESS_c[t, s, c, y] == m.P_BESS_c[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -645,7 +697,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_BESS_d[t, s, c] == m.P_BESS_d[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_BESS_d[t, s, c, y] == m.P_BESS_d[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -653,23 +706,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.E_BESS[t, s, c] == m.E_BESS[t, s, "c0"])
-            if (c != "c0" and t in m.Before[c])
-            else pyo.Constraint.Skip,
-        )
-        model.NonAnt_gamma_c = pyo.Constraint(
-            model.T,
-            model.S,
-            model.C,
-            rule=lambda m, t, s, c: (m.gamma_BESS_c[t, s, c] == m.gamma_BESS_c[t, s, "c0"])
-            if (c != "c0" and t in m.Before[c])
-            else pyo.Constraint.Skip,
-        )
-        model.NonAnt_gamma_d = pyo.Constraint(
-            model.T,
-            model.S,
-            model.C,
-            rule=lambda m, t, s, c: (m.gamma_BESS_d[t, s, c] == m.gamma_BESS_d[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.E_BESS[t, s, c, y] == m.E_BESS[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -677,7 +715,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_PV_curt[t, s, c] == m.P_PV_curt[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_PV_curt[t, s, c, y] == m.P_PV_curt[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -685,7 +724,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_L_shed[t, s, c] == m.P_L_shed[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_L_shed[t, s, c, y] == m.P_L_shed[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -693,7 +733,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_EDS_in[t, s, c] == m.P_EDS_in[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_EDS_in[t, s, c, y] == m.P_EDS_in[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -701,7 +742,8 @@ class MicrogridDesign:
             model.T,
             model.S,
             model.C,
-            rule=lambda m, t, s, c: (m.P_EDS_out[t, s, c] == m.P_EDS_out[t, s, "c0"])
+            model.Y,
+            rule=lambda m, t, s, c, y: (m.P_EDS_out[t, s, c, y] == m.P_EDS_out[t, s, "c0", y])
             if (c != "c0" and t in m.Before[c])
             else pyo.Constraint.Skip,
         )
@@ -722,13 +764,14 @@ class MicrogridDesign:
             m.T,
             m.S,
             m.C,
-            rule=lambda _m, t, s, c: (
-                (_m.P_PV_avail[t, s] - _m.P_PV_curt[t, s, c])
-                + _m.P_BESS_d[t, s, c]
-                - _m.P_BESS_c[t, s, c]
-                + _m.P_EDS_in[t, s, c]
-                - _m.P_EDS_out[t, s, c]
-                == _m.P_L[t, s] - _m.P_L_shed[t, s, c]
+            m.Y,
+            rule=lambda _m, t, s, c, y: (
+                (_m.P_PV_avail[t, s, y] - _m.P_PV_curt[t, s, c, y])
+                + _m.P_BESS_d[t, s, c, y]
+                - _m.P_BESS_c[t, s, c, y]
+                + _m.P_EDS_in[t, s, c, y]
+                - _m.P_EDS_out[t, s, c, y]
+                == _m.P_L[t, s] - _m.P_L_shed[t, s, c, y]
             ),
         )
 
@@ -736,24 +779,25 @@ class MicrogridDesign:
 
         m.CAPEX = pyo.Expression(expr=m.c_CAPEX_PV * m.P_hat_PV + m.c_CAPEX_BESS * m.E_hat_BESS)
         m.OPEX_day = pyo.Expression(
-            expr=sum(
-                m.pi_s[s]
-                * m.pi_c[c]
-                * m.dt_h[t]
+            m.Y,
+            rule=lambda _m, y: sum(
+                _m.pi_s[s]
+                * _m.pi_c[c]
+                * _m.dt_h[t]
                 * (
-                    m.c_EDS[t] * m.P_EDS_in[t, s, c]
-                    + m.c_L_shed * m.P_L_shed[t, s, c]
-                    + m.c_PV_curt * m.P_PV_curt[t, s, c]
-                    + m.c_BESS_deg * (m.P_BESS_c[t, s, c] + m.P_BESS_d[t, s, c])
+                    _m.c_EDS[t] * _m.P_EDS_in[t, s, c, y]
+                    + _m.c_L_shed * _m.P_L_shed[t, s, c, y]
+                    + _m.c_PV_curt * _m.P_PV_curt[t, s, c, y]
+                    + _m.c_BESS_deg * (_m.P_BESS_c[t, s, c, y] + _m.P_BESS_d[t, s, c, y])
                 )
-                for t in m.T
-                for s in m.S
-                for c in m.C
-            )
+                for t in _m.T
+                for s in _m.S
+                for c in _m.C
+            ),
         )
-        m.OPEX_annual = pyo.Expression(expr=m.days_per_year * m.OPEX_day)
+        m.OPEX_annual = pyo.Expression(m.Y, rule=lambda _m, y: _m.days_per_year * _m.OPEX_day[y])
         m.NPV_OPEX = pyo.Expression(
-            expr=sum(m.OPEX_annual / ((1.0 + m.discount_rate) ** y) for y in m.Y)
+            expr=sum(m.OPEX_annual[y] / ((1.0 + m.discount_rate) ** y) for y in m.Y)
         )
         m.Objective = pyo.Objective(expr=m.CAPEX + m.NPV_OPEX, sense=pyo.minimize)
 
@@ -768,6 +812,10 @@ class MicrogridDesign:
             "alpha_BESS_cal": self.param.bess_calendar_fade_per_year,
             "alpha_BESS_cyc": self.param.bess_cyclic_fade_per_kwh,
             "E_BESS_EOL_frac": self.param.bess_eol_capacity_frac,
+            "P_PV_size_max_kw": self.param.pv_size_max_kw,
+            "alpha_PV_year1": self.param.pv_degradation_year1_frac,
+            "alpha_PV_linear": self.param.pv_degradation_linear_frac,
+            "d_PV_y": {int(y): self.param.pv_retention_factor(int(y)) for y in self.model.Y},
         }
         return m
 
@@ -777,7 +825,14 @@ class MicrogridDesign:
         opt = pyo.SolverFactory(solver)
         for k, v in solver_options.items():
             opt.options[k] = v
-        self.results = opt.solve(self.model, tee=tee, load_solutions=True)
+        # Always solve without auto-loading to avoid hard failures when solver
+        # stops on limits (e.g., maxTimeLimit). We load only when a clean
+        # optimal/feasible status is returned.
+        self.results = opt.solve(self.model, tee=tee, load_solutions=False)
+        status = str(self.results.solver.status).lower()
+        term = str(self.results.solver.termination_condition).lower()
+        if status == "ok" and term in {"optimal", "locallyoptimal", "feasible"}:
+            self.model.solutions.load_from(self.results)
         return self.results
 
     def get_results(self):
@@ -789,14 +844,18 @@ class MicrogridDesign:
             return None if val is None else float(val)
 
         m = self.model
+        first_y = m.Y.first()
         return {
             "P_hat_PV_kw": _safe(m.P_hat_PV),
             "E_hat_BESS_kwh": _safe(m.E_hat_BESS),
             "E_BESS_min_life_kwh": _safe(m.E_BESS_min_life),
             "E_BESS_year_kwh": {int(y): _safe(m.E_BESS_year[y]) for y in m.Y},
+            "d_PV_y": {int(y): _safe(m.d_PV_y[y]) for y in m.Y},
             "CAPEX": _safe(m.CAPEX),
-            "OPEX_day": _safe(m.OPEX_day),
-            "OPEX_annual": _safe(m.OPEX_annual),
+            "OPEX_day": _safe(m.OPEX_day[first_y]),
+            "OPEX_annual": _safe(m.OPEX_annual[first_y]),
+            "OPEX_day_by_year": {int(y): _safe(m.OPEX_day[y]) for y in m.Y},
+            "OPEX_annual_by_year": {int(y): _safe(m.OPEX_annual[y]) for y in m.Y},
             "NPV_OPEX": _safe(m.NPV_OPEX),
             "Objective": _safe(m.Objective),
             "metadata": self._meta,
