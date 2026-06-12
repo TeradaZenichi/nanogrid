@@ -21,6 +21,7 @@
     "outage_probability_pct": 10,
     "outage_duration_std_dev_frac": 1.0,
     "outage_duration_hours": 2,
+    "seed": 42,
     "Pmax": 2,
     "Pmin": 1
   },

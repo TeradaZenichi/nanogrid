@@ -27,9 +27,9 @@ import pandas as pd
 # --------------------
 # Module configuration
 # --------------------
-PV_5MIN_CSV = os.getenv("PV_5MIN_CSV", "data/pv_5min_test.csv")
-TRAIN_RESAMPLE_AGG = os.getenv("TRAIN_RESAMPLE_AGG", "mean")  # mean | median | sum
-MAX_INTERVALS = int(os.getenv("FORECAST_MAX_INTERVALS", "432"))
+PV_5MIN_CSV = "data/pv_5min_test.csv"
+TRAIN_RESAMPLE_AGG = "mean"  # mean | median | sum
+MAX_INTERVALS = 432  # 36h @ 5-min
 
 # Fallback configs (used only if caller does not pass configs)
 PV_VSTF_DEFAULT = {"step_minutes": 5, "lookback_steps": 48, "horizon_steps": 12}

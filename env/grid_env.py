@@ -1,5 +1,7 @@
+import json
 import math
 import random
+from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 
@@ -90,23 +92,29 @@ class GridEnv:
         # Base timestep in hours for state update (dt_h); TOU resolution also uses hour-key
         self.dt_h = self.p.get("time", {}).get("timestep", 5) / 60.0
 
-        # Outage probability per step
-        outage_prob_daily = self.p.get("EDS", {}).get("outage_probability_pct", 0.0) / 100.0
-        timestep_min = self.dt_h * 60
-        self.outage_prob_per_step = outage_prob_daily * (timestep_min / (24 * 60))
-
         self.start_dt0 = pd.Timestamp(start_dt0)
 
-        # --- Contingency (outage) duration statistics ---
+        # --- Contingency (outage) statistics ---
+        # At most one outage per day; duration is lognormal with mean equal to
+        # EDS.outage_duration_hours (same value used as the deterministic
+        # contingency window in the sizing model) and coefficient of variation
+        # EDS.outage_duration_std_dev_frac.
         EDS = self.p.get("EDS", {})
-        self.mean_outage_duration_h = float(EDS.get("outage_duration_hours", 4.0)) / 2.0
+        self.outage_prob_daily = float(EDS.get("outage_probability_pct", 0.0)) / 100.0
+        self.mean_outage_duration_h = float(EDS.get("outage_duration_hours", 4.0))
         std_dev_frac = float(EDS.get("outage_duration_std_dev_frac", 0.3))
         self.std_dev_outage_duration_h = self.mean_outage_duration_h * std_dev_frac
 
+        self.outage_seed = EDS.get("seed", None)
+        if self.outage_prob_daily > 0.0 and self.outage_seed is None:
+            raise ValueError(
+                "EDS.seed is required when EDS.outage_probability_pct > 0 "
+                "(outage sampling must be reproducible)."
+            )
+
         self.outage_active = False
         self.outage_end_time = None
-        self.outage_triggered_today = False
-        self.current_day = None
+        self._outage_calendar: List[Dict[str, Any]] = []
         # --- End contingency fields ---
 
         # Series scaling and time vector
@@ -153,16 +161,22 @@ class GridEnv:
 
         noisy_flag = bool(B.get("noisy", False))
         noise_dict = B.get("noise", {}) if isinstance(B.get("noise", {}), dict) else {}
+        # BESS.noisy is the single on/off switch; BESS.noise only parameterizes it.
         self.noise = {
-            "enabled": noisy_flag or bool(noise_dict),
+            "enabled": noisy_flag,
             "type": noise_dict.get("type", "gauss"),
             "std_frac": float(noise_dict.get("std_frac", 0.05)),
             "std_kw": float(noise_dict.get("std_kw", 0.0)),
             "seed": noise_dict.get("seed", None),
         }
-        # RNGs: one for actuator noise, one for outage sampling
-        self._rng = random.Random(self.noise["seed"]) if self.noise["enabled"] and self.noise["seed"] is not None else random
-        self._rng_outage = random.Random(self.noise["seed"]) if self.noise["seed"] is not None else random
+        if self.noise["enabled"] and self.noise["seed"] is None:
+            raise ValueError(
+                "BESS.noise.seed is required when BESS.noisy is true "
+                "(actuator noise must be reproducible)."
+            )
+        # Dedicated RNG for actuator noise; outage sampling uses its own RNG
+        # seeded from EDS.seed (see _generate_outage_calendar).
+        self._rng = random.Random(self.noise["seed"]) if self.noise["enabled"] else None
 
         self.bess = {
             "E_nom": E_nom, "E_min": E_min, "E_max": E_max, "soc_min": soc_min,
@@ -202,12 +216,11 @@ class GridEnv:
         self.E_meas = min(max(E0, self.bess["E_min"]), self.bess["E_max"])
         self._prev_Pb = 0.0
 
-        # Reset contingency flags
+        # Reset contingency state and regenerate the (deterministic) outage calendar
         self.outage_active = False
         self.outage_end_time = None
-        self.current_day = self.start_dt0.date()
-        self.outage_triggered_today = False
-        self.mode = "ongrid"  # Always start on-grid
+        self._generate_outage_calendar()
+        self._set_mode_from_calendar()
 
         self._log(
             "reset: start=%s, E=%.3f kWh (E_min=%.3f, E_max=%.3f, Pmax=%s, ramp=%s)"
@@ -216,38 +229,99 @@ class GridEnv:
                str(self.bess["ramp"]))
         )
 
-    def _update_outage_status(self):
-        """Update the contingency state at each step tail; sets mode for the next step."""
-        if self.timestamp.date() > self.current_day:
-            self._log(f"New day detected ({self.timestamp.date()}). Resetting daily outage flag.")
-            self.current_day = self.timestamp.date()
-            self.outage_triggered_today = False
+    def _generate_outage_calendar(self):
+        """Pre-generate all outage events for the simulation window from EDS.seed.
 
-        if self.outage_active:
-            if self.timestamp >= self.outage_end_time:
-                self._log(f"Outage period finished. Returning to on-grid mode at {self.timestamp}.")
-                self.outage_active = False
-                self.outage_end_time = None
-                self.mode = "ongrid"
-            else:
-                self.mode = "offgrid"
+        One Bernoulli draw per calendar day (at most one outage per day); the
+        outage start is uniform within the day and the duration is lognormal
+        with mean `mean_outage_duration_h` and CV `outage_duration_std_dev_frac`.
+        Events that would start while a previous outage is still active are
+        skipped, matching the old per-step semantics. The calendar depends only
+        on EDS.seed and the simulation window, so every pipeline and every
+        sweep case sees the exact same events (common random numbers).
+        """
+        self._outage_calendar = []
+        if self.outage_prob_daily <= 0.0:
             return
 
-        if not self.outage_active and not self.outage_triggered_today:
-            if self._rng_outage.random() < self.outage_prob_per_step:
-                self.outage_active = True
-                self.outage_triggered_today = True
-                self.mode = "offgrid"
-
-                duration_h = self._rng_outage.gauss(self.mean_outage_duration_h, self.std_dev_outage_duration_h)
-                duration_h = max(self.dt_h, duration_h)  # at least one timestep
-                self.outage_end_time = self.timestamp + pd.Timedelta(hours=duration_h)
-                self._log(f"--- OUTAGE TRIGGERED at {self.timestamp} ---")
-                self._log(f"Duration: {duration_h:.2f} hours. Expected end time: {self.outage_end_time}.")
-            else:
-                self.mode = "ongrid"
+        rng = random.Random(self.outage_seed)
+        m = self.mean_outage_duration_h
+        s = self.std_dev_outage_duration_h
+        if s > 0.0:
+            sigma2 = math.log(1.0 + (s / m) ** 2)
+            mu = math.log(m) - 0.5 * sigma2
+            sigma = math.sqrt(sigma2)
         else:
+            mu, sigma = math.log(m), 0.0
+
+        end_dt = self.start_dt0 + pd.Timedelta(hours=self.n_iters * self.dt_h)
+        day = self.start_dt0.normalize()
+        prev_end = None
+        while day < end_dt:
+            if rng.random() < self.outage_prob_daily:
+                start = day + pd.Timedelta(hours=24.0 * rng.random())
+                duration_h = rng.lognormvariate(mu, sigma) if sigma > 0.0 else m
+                duration_h = max(self.dt_h, duration_h)  # at least one timestep
+                if prev_end is None or start >= prev_end:
+                    end = start + pd.Timedelta(hours=duration_h)
+                    self._outage_calendar.append(
+                        {"start": start, "end": end, "duration_h": float(duration_h)}
+                    )
+                    prev_end = end
+            day = day + pd.Timedelta(days=1)
+
+        self._log(
+            f"Outage calendar generated: {len(self._outage_calendar)} event(s) "
+            f"in [{self.start_dt0}, {end_dt}) with seed={self.outage_seed}."
+        )
+
+    def save_outage_calendar(self, path) -> None:
+        """Persist the outage calendar (and its parameters) as JSON for auditability."""
+        payload = {
+            "seed": self.outage_seed,
+            "outage_prob_daily": self.outage_prob_daily,
+            "duration_mean_h": self.mean_outage_duration_h,
+            "duration_std_h": self.std_dev_outage_duration_h,
+            "duration_distribution": "lognormal",
+            "window_start": str(self.start_dt0),
+            "window_end": str(self.start_dt0 + pd.Timedelta(hours=self.n_iters * self.dt_h)),
+            "events": [
+                {
+                    "start": str(ev["start"]),
+                    "end": str(ev["end"]),
+                    "duration_h": ev["duration_h"],
+                }
+                for ev in self._outage_calendar
+            ],
+        }
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._log(f"Outage calendar saved at: {path.as_posix()}")
+
+    def _set_mode_from_calendar(self):
+        """Set mode/outage flags for the current timestamp from the pre-generated calendar."""
+        active = None
+        for ev in self._outage_calendar:
+            if ev["start"] <= self.timestamp < ev["end"]:
+                active = ev
+                break
+        if active is not None:
+            if not self.outage_active:
+                self._log(f"--- OUTAGE ACTIVE at {self.timestamp} (until {active['end']}) ---")
+            self.outage_active = True
+            self.outage_end_time = active["end"]
+            self.mode = "offgrid"
+        else:
+            if self.outage_active:
+                self._log(f"Outage period finished. Returning to on-grid mode at {self.timestamp}.")
+            self.outage_active = False
+            self.outage_end_time = None
             self.mode = "ongrid"
+
+    def _update_outage_status(self):
+        """Update the contingency state at each step tail; sets mode for the next step."""
+        self._set_mode_from_calendar()
 
     def done(self) -> bool:
         return self.iter_k >= self.n_iters
@@ -352,8 +426,7 @@ class GridEnv:
             base = max(abs(Pb_des), fallback)
             sigma = max(0.0, self.noise["std_kw"]) + max(0.0, self.noise["std_frac"]) * base
             if sigma > 0.0:
-                rng = self._rng or random
-                eps = rng.gauss(0.0, sigma)
+                eps = self._rng.gauss(0.0, sigma)
                 Pb_after_noise = Pb_des + eps
                 clamps["bess_noise"] = {"eps_kw": eps, "sigma_kw": sigma, "base_kw": base}
                 noise_applied = True

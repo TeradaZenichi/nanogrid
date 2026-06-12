@@ -11,12 +11,155 @@ Includes:
 - assembly of forecasts aligned with the time grid
 - helpers for capturing/saving results
 """
+import json
 import os
 import re
+from copy import deepcopy
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
+
+
+# ---------------------------
+# Solver selection and fast defaults
+# ---------------------------
+
+_DETECTED_SOLVER: Optional[str] = None
+
+
+def detect_solver() -> str:
+    """Return 'gurobi' when usable, otherwise 'appsi_highs' (open source).
+
+    Solving a trivial LP is the only check that covers every Gurobi interface
+    (gurobipy, command line, WLS) and validates the license in one shot.
+    The result is cached for the process lifetime.
+    """
+    global _DETECTED_SOLVER
+    if _DETECTED_SOLVER is None:
+        from pyomo.environ import ConcreteModel, Objective, SolverFactory, Var
+
+        try:
+            probe = ConcreteModel()
+            probe.x = Var(bounds=(0, 1))
+            probe.obj = Objective(expr=probe.x)
+            SolverFactory("gurobi").solve(probe, tee=False)
+            _DETECTED_SOLVER = "gurobi"
+        except Exception as e:
+            print(f"[solver] Gurobi unavailable ({type(e).__name__}); falling back to HiGHS.")
+            _DETECTED_SOLVER = "appsi_highs"
+    return _DETECTED_SOLVER
+
+
+# Above this size, barrier/IPM without crossover beats simplex decisively
+# (e.g. the multi-year sizing LP); below it, each solver's default is faster.
+LARGE_LP_VARS = 100_000
+
+
+def _lp_size(model) -> tuple[int, bool]:
+    """(n_active_vars, is_pure_lp); stops counting at the first discrete var."""
+    from pyomo.environ import Var
+
+    n = 0
+    for v in model.component_data_objects(Var, active=True):
+        n += 1
+        if v.is_binary() or v.is_integer():
+            return n, False
+    return n, True
+
+
+def solve_model(model, tee: bool = False,
+                time_limit: Optional[float] = None,
+                threads: Optional[int] = None,
+                mip_gap: Optional[float] = None,
+                solver_name: Optional[str] = None,
+                load_solutions: bool = True):
+    """Solve with Gurobi if licensed, else HiGHS — fastest method by default.
+
+    Large pure LPs (> LARGE_LP_VARS variables, e.g. the sizing model) are
+    pointed at barrier/IPM without crossover; small LPs and MIPs keep each
+    solver's own defaults, which benchmarked faster for the MPC models.
+    """
+    from pyomo.environ import SolverFactory
+
+    name = solver_name or detect_solver()
+    solver = SolverFactory(name)
+    n_vars, lp = _lp_size(model)
+    large_lp = lp and n_vars > LARGE_LP_VARS
+
+    if name == "gurobi":
+        if large_lp:
+            solver.options["Method"] = 2     # barrier
+            solver.options["Crossover"] = 0  # skip basis crossover
+        if time_limit is not None:
+            solver.options["TimeLimit"] = float(time_limit)
+        if threads is not None:
+            solver.options["Threads"] = int(threads)
+        if mip_gap is not None:
+            solver.options["MIPGap"] = float(mip_gap)
+    else:  # appsi_highs (legacy SolverFactory interface)
+        if large_lp:
+            solver.options["solver"] = "ipm"
+            solver.options["run_crossover"] = "off"
+        if time_limit is not None:
+            solver.options["time_limit"] = float(time_limit)
+        if threads is not None:
+            solver.options["threads"] = int(threads)
+        if mip_gap is not None:
+            solver.options["mip_rel_gap"] = float(mip_gap)
+
+    return solver.solve(model, tee=tee, load_solutions=load_solutions)
+
+
+# ---------------------------
+# Sizing -> operation bridge
+# ---------------------------
+
+def apply_sizing_case(params: Dict[str, Any],
+                      case: str,
+                      results_root: str = "Results/sizing") -> Dict[str, Any]:
+    """Override PV/BESS capacities with the sized values of a sizing case.
+
+    Reads Results/sizing/<case>/sizing_decision_variables.json and returns a
+    copy of `params` operating the sized system instead of the catalog one:
+    - PV.Pmax_kw   <- P_hat_PV_kw
+    - BESS.Emax_kwh <- E_hat_BESS_kwh
+    - BESS.Pmax_kw, ramp_kw_per_step and E_init_kwh are rescaled preserving
+      their original ratios to Emax_kwh (C-rate, ramp/Pmax and initial SoC).
+    """
+    path = Path(results_root) / case / "sizing_decision_variables.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Sizing case '{case}' not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    dv = data.get("decision_variables", {}) or {}
+    p_pv = dv.get("P_hat_PV_kw")
+    e_bess = dv.get("E_hat_BESS_kwh")
+    if p_pv is None or e_bess is None:
+        raise ValueError(f"Sizing case '{case}' has no P_hat_PV_kw/E_hat_BESS_kwh in {path}")
+
+    out = deepcopy(params)
+    bess = out["BESS"]
+    e_old = float(bess["Emax_kwh"])
+    p_old = float(bess["Pmax_kw"])
+    e_new = float(e_bess)
+
+    out["PV"]["Pmax_kw"] = float(p_pv)
+    bess["Emax_kwh"] = e_new
+    bess["Pmax_kw"] = (p_old / e_old) * e_new  # preserve C-rate
+    if bess.get("ramp_kw_per_step") is not None:
+        bess["ramp_kw_per_step"] = (float(bess["ramp_kw_per_step"]) / p_old) * bess["Pmax_kw"]
+    if bess.get("E_init_kwh") is not None:
+        bess["E_init_kwh"] = (float(bess["E_init_kwh"]) / e_old) * e_new  # preserve initial SoC
+
+    out["sizing_case_applied"] = {
+        "case": case,
+        "source": path.as_posix(),
+        "P_hat_PV_kw": float(p_pv),
+        "E_hat_BESS_kwh": e_new,
+        "BESS_Pmax_kw": float(bess["Pmax_kw"]),
+    }
+    return out
 
 
 # ---------------------------

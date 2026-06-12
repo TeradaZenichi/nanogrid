@@ -819,16 +819,22 @@ class MicrogridDesign:
         }
         return m
 
-    def optimize(self, solver: str = "gurobi", tee: bool = True, **solver_options):
+    def optimize(self, tee: bool = True,
+                 time_limit: float | None = 3600,
+                 threads: int | None = None,
+                 solver_name: str | None = None):
         if self.model is None:
             raise RuntimeError("Build the model before solving.")
-        opt = pyo.SolverFactory(solver)
-        for k, v in solver_options.items():
-            opt.options[k] = v
-        # Always solve without auto-loading to avoid hard failures when solver
-        # stops on limits (e.g., maxTimeLimit). We load only when a clean
-        # optimal/feasible status is returned.
-        self.results = opt.solve(self.model, tee=tee, load_solutions=False)
+        from opt.utils import solve_model
+
+        # Solver selection (Gurobi -> HiGHS fallback) and the fast LP method
+        # (barrier/IPM without crossover) live in solve_model. Always solve
+        # without auto-loading to avoid hard failures when the solver stops on
+        # limits; we load only when a clean optimal/feasible status is returned.
+        self.results = solve_model(
+            self.model, tee=tee, time_limit=time_limit, threads=threads,
+            solver_name=solver_name, load_solutions=False,
+        )
         status = str(self.results.solver.status).lower()
         term = str(self.results.solver.termination_condition).lower()
         if status == "ok" and term in {"optimal", "locallyoptimal", "feasible"}:

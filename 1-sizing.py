@@ -13,9 +13,10 @@ except ImportError:  # pragma: no cover - optional dependency for plotting only
     plt = None
 
 
+# Solver: escolhido automaticamente (Gurobi se disponivel, senao HiGHS); LPs
+# grandes como este usam barrier/IPM sem crossover — ver opt.utils.solve_model.
 SOLVER_TIME_LIMIT_S = 3600
 SOLVER_THREADS = 8
-SOLVER_METHOD = 1
 
 
 def _to_year_map(year_data):
@@ -145,11 +146,9 @@ def _run_case(params: dict, case_dir: Path, degradation_on: bool):
         )
 
     results = design.optimize(
-        solver="gurobi",
         tee=False,
-        TimeLimit=SOLVER_TIME_LIMIT_S,
-        Method=SOLVER_METHOD,
-        Threads=SOLVER_THREADS,
+        time_limit=SOLVER_TIME_LIMIT_S,
+        threads=SOLVER_THREADS,
     )
     out = design.get_results()
     status = str(results.solver.status)

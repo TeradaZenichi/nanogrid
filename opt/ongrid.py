@@ -9,9 +9,7 @@ organizing the model in component classes (`Parameters`, `Load`, `PV`,
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List
 
 from pyomo.environ import (
@@ -24,31 +22,24 @@ from pyomo.environ import (
     Param,
     Reals,
     Set,
-    SolverFactory,
     UnitInterval,
     Var,
     minimize,
     value,
 )
 
-from .utils import build_time_and_contingencies_from_params, predecessor_pairs
+from .utils import build_time_and_contingencies_from_params, predecessor_pairs, solve_model
 
 
 class Parameters:
-    """Loads and prepares scalar optimization parameters from JSON."""
+    """Prepares scalar optimization parameters from an already-loaded dict."""
 
-    def __init__(self, params_path: Path):
-        self.params_path = Path(params_path)
-        self.raw = self._load_raw()
-        self.data = self._build_data()
-
-    def _load_raw(self) -> Dict[str, Any]:
-        with open(self.params_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+    def __init__(self, params: Dict[str, Any]):
         for sec in ["time", "costs", "BESS", "PV", "Load", "EDS"]:
-            if sec not in raw:
-                raise KeyError(f"Mandatory section missing from JSON: '{sec}'")
-        return raw
+            if sec not in params:
+                raise KeyError(f"Mandatory section missing from parameters: '{sec}'")
+        self.raw = params
+        self.data = self._build_data()
 
     def _build_data(self) -> Dict[str, Any]:
         raw = self.raw
@@ -191,7 +182,8 @@ class Grid:
 
 
 class BESS:
-    def __init__(self, params: Parameters):
+    def __init__(self, params: Parameters, relaxation: bool = False):
+        self.relaxation = relaxation
         p = params.data
         self.c_deg_per_kwh = float(p["c_bess_deg_per_kwh"])
         self.e_nom_kwh = float(p["E_nom_kwh"])
@@ -217,7 +209,6 @@ class BESS:
         model.P_ch = Var(model.T, model.C, domain=NonNegativeReals)
         model.P_dis = Var(model.T, model.C, domain=NonNegativeReals)
         model.P_bess = Var(model.T, model.C, domain=Reals)
-        model.gamma = Var(model.T, model.C, domain=Binary)
         model.E = Var(model.T, model.C, domain=NonNegativeReals)
         model.Pbess_abs = Var(model.T, model.C, domain=NonNegativeReals)
 
@@ -247,12 +238,28 @@ class BESS:
             model.C,
             rule=lambda m, t, c: m.P_ch[t, c] <= (e_max - m.E[t, c]) / (m.eta_c * m.dt_h[t]),
         )
-        model.ChargeLimit = Constraint(
-            model.T, model.C, rule=lambda m, t, c: m.P_ch[t, c] <= m.P_ch_max * m.gamma[t, c]
-        )
-        model.DischargeLimit = Constraint(
-            model.T, model.C, rule=lambda m, t, c: m.P_dis[t, c] <= m.P_dis_max * (1 - m.gamma[t, c])
-        )
+        if self.relaxation:
+            # Pozo et al. Extn-LP (Formulation 5), same as the sizing model:
+            # the affine coupling P_ch + P_dis <= P_max replaces the binary
+            # mode variable; with the energy caps above the polytope has no
+            # simultaneous charge/discharge at its vertices.
+            model.ChargeLimit = Constraint(
+                model.T, model.C, rule=lambda m, t, c: m.P_ch[t, c] <= m.P_ch_max
+            )
+            model.DischargeLimit = Constraint(
+                model.T, model.C, rule=lambda m, t, c: m.P_dis[t, c] <= m.P_dis_max
+            )
+            model.RelaxCoupling = Constraint(
+                model.T, model.C, rule=lambda m, t, c: m.P_dis[t, c] <= m.P_dis_max - m.P_ch[t, c]
+            )
+        else:
+            model.gamma = Var(model.T, model.C, domain=Binary)
+            model.ChargeLimit = Constraint(
+                model.T, model.C, rule=lambda m, t, c: m.P_ch[t, c] <= m.P_ch_max * m.gamma[t, c]
+            )
+            model.DischargeLimit = Constraint(
+                model.T, model.C, rule=lambda m, t, c: m.P_dis[t, c] <= m.P_dis_max * (1 - m.gamma[t, c])
+            )
 
         model.RampLo = Constraint(
             model.TRANS,
@@ -340,11 +347,10 @@ class Scenarios:
 class OnGridMPC:
     """Public on-grid MPC class. API compatible with previous implementation."""
 
-    def __init__(self, params_path: str = "data/parameters.json", relaxation: bool = False):
-        self.params_path = Path(params_path)
+    def __init__(self, params: Dict[str, Any], relaxation: bool = False):
         self.relaxation = relaxation
-        self.param = Parameters(self.params_path)
-        self.bess = BESS(self.param)
+        self.param = Parameters(params)
+        self.bess = BESS(self.param, relaxation=self.relaxation)
         self.load = Load(self.param, relaxation=self.relaxation)
         self.pv = PV(self.param)
         self.grid = Grid(self.param)
@@ -419,11 +425,16 @@ class OnGridMPC:
         self.model = model
         return model
 
-    def solve(self, solver_name: str = "gurobi", tee: bool = True, **solver_opts):
-        solver = SolverFactory(solver_name)
-        for k, v in solver_opts.items():
-            solver.options[k] = v
-        self.results = solver.solve(self.model, tee=tee)
+    def solve(self, tee: bool = False,
+              time_limit: float | None = 120,
+              threads: int | None = 1,
+              mip_gap: float | None = 0.01,
+              solver_name: str | None = None):
+        """Solve with Gurobi if licensed, else HiGHS (see opt.utils.solve_model)."""
+        self.results = solve_model(
+            self.model, tee=tee, time_limit=time_limit, threads=threads,
+            mip_gap=mip_gap, solver_name=solver_name,
+        )
         return self.results
 
     def extract_first_step(self, scenario: Any = "c0") -> Dict[str, float]:
@@ -435,7 +446,9 @@ class OnGridMPC:
             "P_bess_kw": value(m.P_bess[t0, c]),
             "P_ch_kw": value(m.P_ch[t0, c]),
             "P_dis_kw": value(m.P_dis[t0, c]),
-            "gamma": int(round(value(m.gamma[t0, c]))),
+            # Without the binary (Extn-LP) the mode is derived from the powers.
+            "gamma": (int(round(value(m.gamma[t0, c]))) if hasattr(m, "gamma")
+                      else int(value(m.P_ch[t0, c]) > 1e-6)),
             "X_L": value(m.X_L[t0, c]),
             "X_PV": value(m.X_PV[t0, c]),
             "E_kwh": value(m.E[t0, c]),
