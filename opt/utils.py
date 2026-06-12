@@ -38,16 +38,20 @@ def detect_solver() -> str:
     """
     global _DETECTED_SOLVER
     if _DETECTED_SOLVER is None:
-        from pyomo.environ import ConcreteModel, Objective, SolverFactory, Var
+        from pyomo.environ import ConcreteModel, Objective, RangeSet, SolverFactory, Var, quicksum
 
         try:
+            # 2100 variables: above the 2000-var cap of the pip-installed
+            # size-limited Gurobi license, so restricted installs are caught
+            # here instead of failing later on the real (large) models.
             probe = ConcreteModel()
-            probe.x = Var(bounds=(0, 1))
-            probe.obj = Objective(expr=probe.x)
+            probe.I = RangeSet(2100)
+            probe.x = Var(probe.I, bounds=(0, 1))
+            probe.obj = Objective(expr=quicksum(probe.x[i] for i in probe.I))
             SolverFactory("gurobi").solve(probe, tee=False)
             _DETECTED_SOLVER = "gurobi"
         except Exception as e:
-            print(f"[solver] Gurobi unavailable ({type(e).__name__}); falling back to HiGHS.")
+            print(f"[solver] Gurobi unavailable or size-limited ({type(e).__name__}); falling back to HiGHS.")
             _DETECTED_SOLVER = "appsi_highs"
     return _DETECTED_SOLVER
 
@@ -109,7 +113,22 @@ def solve_model(model, tee: bool = False,
         if mip_gap is not None:
             solver.options["mip_rel_gap"] = float(mip_gap)
 
-    return solver.solve(model, tee=tee, load_solutions=load_solutions)
+    try:
+        return solver.solve(model, tee=tee, load_solutions=load_solutions)
+    except Exception as e:
+        # Last-resort safety net: a Gurobi that passed detection can still
+        # fail at solve time (license size cap, expired WLS, quota). Retry
+        # once with HiGHS — unless the caller forced a specific solver.
+        if name == "gurobi" and solver_name is None:
+            global _DETECTED_SOLVER
+            print(f"[solver] Gurobi failed at solve time ({e}); retrying with HiGHS.")
+            _DETECTED_SOLVER = "appsi_highs"
+            return solve_model(
+                model, tee=tee, time_limit=time_limit, threads=threads,
+                mip_gap=mip_gap, solver_name="appsi_highs",
+                load_solutions=load_solutions,
+            )
+        raise
 
 
 # ---------------------------
