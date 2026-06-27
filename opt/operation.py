@@ -85,6 +85,22 @@ def _finish_case(env: GridEnv, out_dir: Path, metrics: Dict[str, Any]) -> Dict[s
     return metrics
 
 
+def _cached_metrics(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """Return a completed case's metrics.json, or None if absent/partial.
+
+    Case-level resume: a run that already produced a parseable metrics.json is
+    considered done and skipped. A corrupt/partial file (crash mid-write) is
+    treated as not-done so the case re-runs.
+    """
+    path = Path(out_dir) / "metrics.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def simulate_stochastic(
     params: dict,
     start_ts,
@@ -93,8 +109,14 @@ def simulate_stochastic(
     load_csv: str = DEFAULT_LOAD_CSV,
     pv_csv: str = DEFAULT_PV_CSV,
     solver_opts: Optional[dict] = None,
+    resume: bool = True,
 ) -> Dict[str, Any]:
     """Solve the scenario model once and execute the cached plan in closed loop."""
+    if resume:
+        cached = _cached_metrics(out_dir)
+        if cached is not None:
+            print(f"[skip] {Path(out_dir).name}: already complete (metrics.json found)")
+            return cached
     validate_time_mesh(params)
     out_dir = _prepare_case_dir(params, Path(out_dir))
     env = _make_env(params, load_csv, pv_csv, start_ts, n_iters, out_dir)
@@ -170,6 +192,7 @@ def simulate_mpc(
     solver_opts: Optional[dict] = None,
     forecaster_name: str = "",
     progress_every: int = 288,
+    resume: bool = True,
 ) -> Dict[str, Any]:
     """Rolling-horizon MPC in closed loop, re-solving at every on-grid step.
 
@@ -177,6 +200,11 @@ def simulate_mpc(
     get_forecasts(start_dt0, intervals=None, dt_min=..., include_actuals=False)
     -> {"load_kw": {ts: kW}, "pv_kw": {ts: kW}} aligned with env.dt_min.
     """
+    if resume:
+        cached = _cached_metrics(out_dir)
+        if cached is not None:
+            print(f"[skip] {Path(out_dir).name}: already complete (metrics.json found)")
+            return cached
     validate_time_mesh(params)
     out_dir = _prepare_case_dir(params, Path(out_dir))
     env = _make_env(params, load_csv, pv_csv, start_ts, n_iters, out_dir)
