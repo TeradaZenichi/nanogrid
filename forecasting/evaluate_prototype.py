@@ -13,7 +13,12 @@ full-day nearest-prototype assignment as the reference.
 
 Usage: call run_evaluation(days=..., every_min=..., with_lstm=...) — see 2-forecast_eval.py.
 
+The run is resumable: per-origin partial sums are appended to
+prototype_eval_checkpoint.csv every CHECKPOINT_EVERY origins, and a restart
+skips origins already present. Delete that file to force a fresh run.
+
 Outputs (Results/forecasting/):
+    prototype_eval_checkpoint.csv   (resumable per-origin partial sums)
     prototype_eval_metrics.csv
     prototype_eval_summary.json
     prototype_eval_error_by_lead.png
@@ -57,6 +62,7 @@ LEAD_BUCKETS_H = [(0, 1), (1, 6), (6, 12), (12, 24), (24, 36)]
 HORIZON_MIN = 36 * 60
 STEP_MIN = 5
 N_STEPS = HORIZON_MIN // STEP_MIN
+CHECKPOINT_EVERY = 100  # flush partial results to disk every N origins
 
 
 def _forecast_to_array(fc_dict: dict) -> np.ndarray:
@@ -82,28 +88,43 @@ def _actuals(s: pd.Series, t0: pd.Timestamp) -> np.ndarray:
     return s.reindex(idx).to_numpy(dtype=float)
 
 
-def _bucket_metrics(err_rows: list[dict]) -> pd.DataFrame:
-    """err_rows: dicts with method, target, resolution, lead_h, abs_err, sq_err."""
+def _bucketize_origin(err_rows: list[dict], origin: pd.Timestamp) -> list[dict]:
+    """Collapse one origin's per-lead errors into per-bucket partial sums.
+
+    Returns additive aggregates (n, sum_abs, sum_sq) tagged with the origin so
+    they can be appended to the checkpoint and later summed across origins.
+    """
+    if not err_rows:
+        return []
     df = pd.DataFrame(err_rows)
-    records = []
+    out = []
     for (method, target, res), g in df.groupby(["method", "target", "resolution"]):
         for lo, hi in LEAD_BUCKETS_H:
             gb = g[(g["lead_h"] > lo) & (g["lead_h"] <= hi)]
             if gb.empty:
                 continue
-            records.append(
+            out.append(
                 {
+                    "origin": str(origin),
                     "method": method,
                     "target": target,
                     "resolution": res,
                     "lead_bucket_h": f"({lo},{hi}]",
                     "n": int(len(gb)),
-                    "mae": float(gb["abs_err"].mean()),
-                    "rmse": float(np.sqrt(gb["sq_err"].mean())),
+                    "sum_abs": float(gb["abs_err"].sum()),
+                    "sum_sq": float(gb["sq_err"].sum()),
                 }
             )
-    out = pd.DataFrame(records)
-    # Skill vs seasonal-naive (same target/resolution/bucket)
+    return out
+
+
+def _finalize_metrics(df_ckpt: pd.DataFrame) -> pd.DataFrame:
+    """Combine checkpoint partial sums (across origins) into MAE/RMSE/skill."""
+    out = df_ckpt.groupby(
+        ["method", "target", "resolution", "lead_bucket_h"], as_index=False
+    ).agg(n=("n", "sum"), sum_abs=("sum_abs", "sum"), sum_sq=("sum_sq", "sum"))
+    out["mae"] = out["sum_abs"] / out["n"]
+    out["rmse"] = np.sqrt(out["sum_sq"] / out["n"])
     base = out[out["method"] == "seasonal-naive"].set_index(
         ["target", "resolution", "lead_bucket_h"]
     )["mae"]
@@ -204,8 +225,27 @@ def run_evaluation(
 
         lstm = ForecastMPC({}, load_s, pv_s, pv_scale, load_scale)
 
-    rows: list[dict] = []
+    # Resumable checkpoint: per-origin bucket partial sums appended to disk so
+    # an interrupted run (crash, instance stop) resumes instead of restarting.
+    ckpt_path = out_dir / "prototype_eval_checkpoint.csv"
+    done_origins: set[str] = set()
+    if ckpt_path.exists():
+        done_origins = set(pd.read_csv(ckpt_path, usecols=["origin"])["origin"].astype(str))
+        print(f"[eval] resuming from checkpoint: {len(done_origins)} origins already done")
+
+    buffer: list[dict] = []
+
+    def _flush() -> None:
+        if not buffer:
+            return
+        pd.DataFrame(buffer).to_csv(
+            ckpt_path, mode="a", header=not ckpt_path.exists(), index=False
+        )
+        buffer.clear()
+
     for k, t0 in enumerate(origins):
+        if str(t0) in done_origins:
+            continue
         y_true_load = _actuals(load_s, t0)
         y_true_pv = _actuals(pv_s, t0)
         if np.isnan(y_true_load).all():
@@ -228,14 +268,22 @@ def run_evaluation(
             except Exception as e:
                 print(f"[eval] lstm failed at {t0}: {e}")
 
+        local_rows: list[dict] = []
         for name, (yl, yp) in methods.items():
-            _accumulate_errors(rows, name, "load", yl, y_true_load)
-            _accumulate_errors(rows, name, "pv", yp, y_true_pv)
+            _accumulate_errors(local_rows, name, "load", yl, y_true_load)
+            _accumulate_errors(local_rows, name, "pv", yp, y_true_pv)
+        buffer.extend(_bucketize_origin(local_rows, t0))
 
-        if (k + 1) % 50 == 0:
-            print(f"[eval] {k + 1}/{len(origins)} origins done")
+        if (k + 1) % CHECKPOINT_EVERY == 0:
+            _flush()
+            print(f"[eval] {k + 1}/{len(origins)} origins done (checkpointed)")
+    _flush()
 
-    metrics = _bucket_metrics(rows)
+    if not ckpt_path.exists():
+        print("[eval] no origins evaluated; nothing to finalize.")
+        return
+
+    metrics = _finalize_metrics(pd.read_csv(ckpt_path))
     metrics_csv = out_dir / "prototype_eval_metrics.csv"
     metrics.to_csv(metrics_csv, index=False)
     print(f"[eval] metrics saved: {metrics_csv.as_posix()}")
