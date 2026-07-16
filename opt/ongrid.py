@@ -239,10 +239,7 @@ class BESS:
             rule=lambda m, t, c: m.P_ch[t, c] <= (e_max - m.E[t, c]) / (m.eta_c * m.dt_h[t]),
         )
         if self.relaxation:
-            # Pozo et al. Extn-LP (Formulation 5), same as the sizing model:
-            # the affine coupling P_ch + P_dis <= P_max replaces the binary
-            # mode variable; with the energy caps above the polytope has no
-            # simultaneous charge/discharge at its vertices.
+            # Extn-LP (Pozo et al. F5): P_ch + P_dis <= P_max instead of a binary.
             model.ChargeLimit = Constraint(
                 model.T, model.C, rule=lambda m, t, c: m.P_ch[t, c] <= m.P_ch_max
             )
@@ -446,7 +443,6 @@ class OnGridMPC:
             "P_bess_kw": value(m.P_bess[t0, c]),
             "P_ch_kw": value(m.P_ch[t0, c]),
             "P_dis_kw": value(m.P_dis[t0, c]),
-            # Without the binary (Extn-LP) the mode is derived from the powers.
             "gamma": (int(round(value(m.gamma[t0, c]))) if hasattr(m, "gamma")
                       else int(value(m.P_ch[t0, c]) > 1e-6)),
             "X_L": value(m.X_L[t0, c]),

@@ -1,19 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-Closed-loop operation simulators (the logic of the former root pipelines).
+"""Closed-loop simulation drivers: rolling-horizon MPC and receding stochastic plan.
 
-Two entry points, both driving a GridEnv plant and saving the same artifacts
-(parameters_used.json, outage_calendar.json, operation_final.csv, metrics.json):
-
-- simulate_stochastic: solve the scenario-based model ONCE at the start,
-  cache the shared control trajectory, then consume it step by step
-  (open-loop execution of a stochastic plan).
-
-- simulate_mpc: rolling-horizon MPC; at every on-grid step asks the given
-  `forecaster` for a window (PerfectForecast = oracle, ForecastMPC = LSTM,
-  PrototypeForecast = analog day, HybridForecast = mix) and re-solves.
-
-Both return the metrics dict that is also written to <out_dir>/metrics.json.
+Both run a GridEnv plant, write the case artifacts (parameters_used.json,
+outage_calendar.json, operation_final.csv, metrics.json) and return the
+metrics dict. Cases with an existing metrics.json are skipped (resume).
 """
 
 from __future__ import annotations
@@ -86,12 +76,7 @@ def _finish_case(env: GridEnv, out_dir: Path, metrics: Dict[str, Any]) -> Dict[s
 
 
 def _cached_metrics(out_dir: Path) -> Optional[Dict[str, Any]]:
-    """Return a completed case's metrics.json, or None if absent/partial.
-
-    Case-level resume: a run that already produced a parseable metrics.json is
-    considered done and skipped. A corrupt/partial file (crash mid-write) is
-    treated as not-done so the case re-runs.
-    """
+    """Metrics of a finished case, or None (missing or corrupt -> re-run)."""
     path = Path(out_dir) / "metrics.json"
     if not path.exists():
         return None
@@ -109,9 +94,12 @@ def simulate_stochastic(
     load_csv: str = DEFAULT_LOAD_CSV,
     pv_csv: str = DEFAULT_PV_CSV,
     solver_opts: Optional[dict] = None,
+    resolve_every_h: float = 24.0,
     resume: bool = True,
 ) -> Dict[str, Any]:
-    """Solve the scenario model once and execute the cached plan in closed loop."""
+    """Receding stochastic plan: solve from the measured state, follow the
+    plan open-loop (actions held over their model timestep), re-solve every
+    `resolve_every_h` hours or when the plan window is exhausted."""
     if resume:
         cached = _cached_metrics(out_dir)
         if cached is not None:
@@ -120,39 +108,69 @@ def simulate_stochastic(
     validate_time_mesh(params)
     out_dir = _prepare_case_dir(params, Path(out_dir))
     env = _make_env(params, load_csv, pv_csv, start_ts, n_iters, out_dir)
+    plans_dir = out_dir / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
 
     operation = OnGridStochasticOperation(params, relaxation=True)
+    opts = solver_opts or DEFAULT_STOCH_SOLVER_OPTS
 
-    solve_t0 = time.perf_counter()
-    operation.build(
-        start_dt=env.timestamp.to_pydatetime(),
-        forecasts=None,  # the stochastic model uses train clusters, not forecasts
-        E_hat_kwh=float(env.E_meas),
-        P_bess_hat_kw=0.0,
-    )
-    results = operation.solve(tee=False, **(solver_opts or DEFAULT_STOCH_SOLVER_OPTS))
-    solve_time_s = time.perf_counter() - solve_t0
-    print(
-        f"[stochastic] solve: status={results.solver.status} "
-        f"term={results.solver.termination_condition} time={solve_time_s:.1f}s"
-    )
+    n_solves = 0
+    n_solve_fail = 0
+    n_fallback_steps = 0
+    solve_time_total = 0.0
+    max_simultaneity_kw = 0.0
+    last_status, last_term = "none", "none"
+    pbess_prev_kw = 0.0
+    next_resolve = env.timestamp  # forces the initial solve
 
-    plan = operation.extract_full_solution()
-    (out_dir / "stochastic_plan.json").write_text(
-        json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    def _resolve(now: pd.Timestamp) -> None:
+        nonlocal n_solves, n_solve_fail, solve_time_total, next_resolve
+        nonlocal max_simultaneity_kw, last_status, last_term
+        try:
+            t0 = time.perf_counter()
+            operation.build(
+                start_dt=now.to_pydatetime(),
+                forecasts=None,  # the stochastic model uses train clusters, not forecasts
+                E_hat_kwh=float(env.E_meas),
+                P_bess_hat_kw=pbess_prev_kw,
+            )
+            results = operation.solve(tee=False, **opts)
+            dt = time.perf_counter() - t0
+            solve_time_total += dt
+            n_solves += 1
+            last_status = str(results.solver.status)
+            last_term = str(results.solver.termination_condition)
+            print(
+                f"[stochastic] solve {n_solves} at {now}: status={last_status} "
+                f"term={last_term} time={dt:.1f}s"
+            )
+            (plans_dir / f"plan_{now.strftime('%Y%m%dT%H%M')}.json").write_text(
+                json.dumps(operation.extract_full_solution(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            # relaxation exactness check: should stay at zero
+            max_simultaneity_kw = max(
+                max_simultaneity_kw,
+                max(
+                    (min(a.get("P_ch_kw", 0.0), a.get("P_dis_kw", 0.0)) for a in operation._actions),
+                    default=0.0,
+                ),
+            )
+            next_resolve = now + pd.Timedelta(hours=float(resolve_every_h))
+        except Exception as e:
+            n_solve_fail += 1
+            print(f"[stochastic] WARN: solve failed at {now}: {e}. Retrying in 1h.")
+            next_resolve = now + pd.Timedelta(hours=1.0)
 
-    # Exactness audit of the Extn-LP relaxation (Pozo et al.): simultaneous
-    # charge/discharge should never appear at the optimum.
-    max_simultaneity_kw = max(
-        (min(a.get("P_ch_kw", 0.0), a.get("P_dis_kw", 0.0)) for a in operation._actions),
-        default=0.0,
-    )
-
-    # Consume the cached trajectory step by step (open loop: no re-solve).
     while not env.done():
         loop_t0 = time.perf_counter()
-        action = operation.get_control(advance=True)
+        now = env.timestamp
+
+        # Re-solve on schedule or when the plan window ran out; never while islanded.
+        if env.mode != "offgrid" and (now >= next_resolve or not operation.get_control_at(now)):
+            _resolve(now)
+
+        action = operation.get_control_at(now)
         if action:
             P_bess = float(action.get("P_bess_kw", 0.0))
             X_L = float(action.get("X_L", 0.0))
@@ -160,22 +178,30 @@ def simulate_stochastic(
             obj = float(action.get("obj", 0.0))
         else:
             P_bess, X_L, X_PV, obj = 0.0, None, None, None  # safe fallback
-        _, done = env.step(
+            if env.mode != "offgrid":
+                n_fallback_steps += 1
+        row, done = env.step(
             P_bess_kw=P_bess, X_L=X_L, X_PV=X_PV, obj=obj,
             exec_time_sec=time.perf_counter() - loop_t0,
         )
+        pbess_prev_kw = float(row.get("P_bess_kw", P_bess)) if isinstance(row, dict) else P_bess
         if done:
             break
 
     metrics = {
         "controller": "stochastic",
-        "status": str(results.solver.status),
-        "termination": str(results.solver.termination_condition),
+        "status": last_status,
+        "termination": last_term,
         "horizon_hours": int(params["time"]["horizon_hours"]),
         "timestep_1_min": int(params["time"]["timestep_1_min"]),
         "timestep_2_min": int(params["time"]["timestep_2_min"]),
         "n_iters": int(n_iters),
-        "solve_time_s": float(solve_time_s),
+        "resolve_every_h": float(resolve_every_h),
+        "n_solves": int(n_solves),
+        "n_solve_fail": int(n_solve_fail),
+        "n_fallback_steps": int(n_fallback_steps),
+        "total_solve_time_s": float(solve_time_total),
+        "avg_solve_time_s": float(solve_time_total / n_solves) if n_solves else None,
         "max_simultaneous_ch_dis_kw": float(max_simultaneity_kw),
     }
     return _finish_case(env, out_dir, metrics)
@@ -215,7 +241,7 @@ def simulate_mpc(
     pbess_prev_kw = 0.0
     n_ongrid = n_offgrid = n_solve_ok = n_solve_fail = 0
     solve_time_total = 0.0
-    max_simultaneity_kw = 0.0  # exactness audit of the Extn-LP relaxation
+    max_simultaneity_kw = 0.0
     run_t0 = time.perf_counter()
 
     while not env.done():
@@ -223,7 +249,6 @@ def simulate_mpc(
         now = env.timestamp
 
         if env.mode == "offgrid":
-            # The plant follows the islanding balance by itself; no solve.
             n_offgrid += 1
             step0 = None
         else:

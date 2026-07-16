@@ -1,28 +1,14 @@
 # -*- coding: utf-8 -*-
 # File: forecasting/evaluate_prototype.py
-"""
-Offline evaluation of the analog-day (prototype) forecaster against naive
-baselines (and optionally the LSTM pipeline), on the test series.
+"""Offline forecast evaluation on the test series.
 
-For each forecast origin (default: every 60 min), each method produces a
-36h-ahead forecast on a 5-min grid. Errors are reported by lead-time bucket
-at two resolutions (native 5-min and 60-min block means), with skill scores
-relative to the seasonal-naive baseline. Also reports cluster-classification
-accuracy of the prefix strategy as a function of the hour of day, using the
-full-day nearest-prototype assignment as the reference.
+Each method produces a 36h forecast on a 5-min grid at every origin; errors
+are bucketed by lead time (5-min and 60-min block resolutions) with skill
+vs the seasonal-naive baseline. Resumable: per-origin partial sums go to
+prototype_eval_checkpoint.csv and finished origins are skipped on restart
+(delete the file for a fresh run). Outputs land in Results/forecasting/.
 
-Usage: call run_evaluation(days=..., every_min=..., with_lstm=...) — see 2-forecast_eval.py.
-
-The run is resumable: per-origin partial sums are appended to
-prototype_eval_checkpoint.csv every CHECKPOINT_EVERY origins, and a restart
-skips origins already present. Delete that file to force a fresh run.
-
-Outputs (Results/forecasting/):
-    prototype_eval_checkpoint.csv   (resumable per-origin partial sums)
-    prototype_eval_metrics.csv
-    prototype_eval_summary.json
-    prototype_eval_error_by_lead.png
-    prototype_eval_cluster_accuracy.png
+Entry point: run_evaluation() — see experiments/02_forecast_eval.py.
 """
 
 from __future__ import annotations

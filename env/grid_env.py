@@ -230,15 +230,11 @@ class GridEnv:
         )
 
     def _generate_outage_calendar(self):
-        """Pre-generate all outage events for the simulation window from EDS.seed.
+        """Pre-generate outage events from EDS.seed for the whole window.
 
-        One Bernoulli draw per calendar day (at most one outage per day); the
-        outage start is uniform within the day and the duration is lognormal
-        with mean `mean_outage_duration_h` and CV `outage_duration_std_dev_frac`.
-        Events that would start while a previous outage is still active are
-        skipped, matching the old per-step semantics. The calendar depends only
-        on EDS.seed and the simulation window, so every pipeline and every
-        sweep case sees the exact same events (common random numbers).
+        At most one outage per day (Bernoulli draw), start uniform within the
+        day, duration lognormal. Deterministic given seed + window, so all
+        controllers see the same events.
         """
         self._outage_calendar = []
         if self.outage_prob_daily <= 0.0:
@@ -504,6 +500,34 @@ class GridEnv:
                     Pgrid_in += take
                     residual -= take
                     clamps["grid_import"] = {"kW": take, "outage": False}
+            if residual > self.tol_kw and Pch > 1e-9:
+                # merit order: interrupt battery charging before shedding load
+                dec = min(Pch, residual)
+                Pch -= dec
+                Pb_eff = Pdis - Pch
+                clamps["ongrid_autofix_reduce_charge"] = {"kW": float(dec)}
+                supply = usedpv + Pdis + Pgrid_in - Pgrid_out
+                ref_line = served + Pch
+                residual = ref_line - supply
+            if residual > self.tol_kw:
+                # merit order: dispatch available discharge before shedding,
+                # bounded by Pmax, ramp window and stored energy
+                pmax = self.bess["P_max"]
+                if math.isinf(pmax):
+                    pmax = 1e12
+                hi = pmax
+                if self.bess["ramp"] is not None:
+                    hi = min(hi, self._prev_Pb + self.bess["ramp"])
+                pdis_cap_e = self.bess["eta_d"] * max(self.E_meas - self.bess["E_min"], 0.0) / max(self.dt_h, 1e-9)
+                boost = min(residual, max(0.0, hi - Pb_eff), max(0.0, pdis_cap_e - Pdis))
+                if boost > self.tol_kw:
+                    Pdis += boost
+                    Pb_eff = Pdis - Pch
+                    residual -= boost
+                    clamps["ongrid_autofix_discharge_boost"] = {"kW": float(boost)}
+                    supply = usedpv + Pdis + Pgrid_in - Pgrid_out
+                    ref_line = served + Pch
+                    residual = ref_line - supply
             if residual > self.tol_kw:
                 needed_kw = residual
                 shed_step_kw = 0.10 * load0

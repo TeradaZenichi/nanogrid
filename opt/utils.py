@@ -30,20 +30,16 @@ _DETECTED_SOLVER: Optional[str] = None
 
 
 def detect_solver() -> str:
-    """Return 'gurobi' when usable, otherwise 'appsi_highs' (open source).
+    """'gurobi' if a solve works, else 'appsi_highs'. Cached per process.
 
-    Solving a trivial LP is the only check that covers every Gurobi interface
-    (gurobipy, command line, WLS) and validates the license in one shot.
-    The result is cached for the process lifetime.
+    The probe has 2100 variables so the size-limited pip license (2000-var
+    cap) fails here instead of on the real models.
     """
     global _DETECTED_SOLVER
     if _DETECTED_SOLVER is None:
         from pyomo.environ import ConcreteModel, Objective, RangeSet, SolverFactory, Var, quicksum
 
         try:
-            # 2100 variables: above the 2000-var cap of the pip-installed
-            # size-limited Gurobi license, so restricted installs are caught
-            # here instead of failing later on the real (large) models.
             probe = ConcreteModel()
             probe.I = RangeSet(2100)
             probe.x = Var(probe.I, bounds=(0, 1))
@@ -56,8 +52,7 @@ def detect_solver() -> str:
     return _DETECTED_SOLVER
 
 
-# Above this size, barrier/IPM without crossover beats simplex decisively
-# (e.g. the multi-year sizing LP); below it, each solver's default is faster.
+# Above this size barrier/IPM without crossover beats the solver defaults.
 LARGE_LP_VARS = 100_000
 
 
@@ -79,12 +74,8 @@ def solve_model(model, tee: bool = False,
                 mip_gap: Optional[float] = None,
                 solver_name: Optional[str] = None,
                 load_solutions: bool = True):
-    """Solve with Gurobi if licensed, else HiGHS — fastest method by default.
-
-    Large pure LPs (> LARGE_LP_VARS variables, e.g. the sizing model) are
-    pointed at barrier/IPM without crossover; small LPs and MIPs keep each
-    solver's own defaults, which benchmarked faster for the MPC models.
-    """
+    """Solve with Gurobi if available, else HiGHS. Large pure LPs use
+    barrier/IPM without crossover; everything else keeps solver defaults."""
     from pyomo.environ import SolverFactory
 
     name = solver_name or detect_solver()
@@ -116,9 +107,8 @@ def solve_model(model, tee: bool = False,
     try:
         return solver.solve(model, tee=tee, load_solutions=load_solutions)
     except Exception as e:
-        # Last-resort safety net: a Gurobi that passed detection can still
-        # fail at solve time (license size cap, expired WLS, quota). Retry
-        # once with HiGHS — unless the caller forced a specific solver.
+        # Gurobi can pass detection and still fail here (license cap/quota);
+        # retry once with HiGHS unless the caller forced a solver.
         if name == "gurobi" and solver_name is None:
             global _DETECTED_SOLVER
             print(f"[solver] Gurobi failed at solve time ({e}); retrying with HiGHS.")
@@ -138,14 +128,10 @@ def solve_model(model, tee: bool = False,
 def apply_sizing_case(params: Dict[str, Any],
                       case: str,
                       results_root: str = "Results/sizing") -> Dict[str, Any]:
-    """Override PV/BESS capacities with the sized values of a sizing case.
+    """Copy of `params` with PV/BESS capacities taken from a sizing case.
 
-    Reads Results/sizing/<case>/sizing_decision_variables.json and returns a
-    copy of `params` operating the sized system instead of the catalog one:
-    - PV.Pmax_kw   <- P_hat_PV_kw
-    - BESS.Emax_kwh <- E_hat_BESS_kwh
-    - BESS.Pmax_kw, ramp_kw_per_step and E_init_kwh are rescaled preserving
-      their original ratios to Emax_kwh (C-rate, ramp/Pmax and initial SoC).
+    Pmax, ramp and E_init are rescaled keeping their original ratios to
+    Emax_kwh (C-rate, ramp/Pmax, initial SoC).
     """
     path = Path(results_root) / case / "sizing_decision_variables.json"
     if not path.exists():

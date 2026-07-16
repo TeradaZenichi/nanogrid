@@ -1,23 +1,11 @@
 # -*- coding: utf-8 -*-
 # File: forecasting/prototype_forecast.py
-"""
-Analog-day (cluster prototype) forecaster for the MPC pipeline.
+"""Analog-day forecasters built on the DTW cluster prototypes (48 x 30-min slots).
 
-Uses the DTW cluster prototypes produced by forecasting/clustering (48 slots
-of 30 min, normalized [0,1]) as the long-duration forecast. The current day's
-cluster is selected by one of three strategies:
-
-- "calendar": most probable cluster from the train marginals (works at 00:00).
-- "prefix":   classify the observed prefix of the current day against the
-              prototypes truncated to the same slots (Euclidean distance).
-- "knn":      same prefix distance, but against the real train days; the
-              forecast is the remainder of the nearest day (k=1).
-
-Days beyond the current one (the 36h horizon crosses midnight) always use the
-"calendar" cluster, since no prefix exists for the future.
-
-Output format is identical to ForecastMPC.get_forecasts(); intentionally free
-of any TensorFlow dependency.
+Cluster selection strategies: "calendar" (most probable from train marginals),
+"prefix" (nearest prototype to the observed part of the day) and "knn"
+(nearest real train day). Days beyond the current one fall back to "calendar".
+Same get_forecasts() interface as ForecastMPC, without the TensorFlow import.
 """
 
 from __future__ import annotations
@@ -134,11 +122,7 @@ def _daily_matrix_30min(csv_path: Path) -> pd.DataFrame:
 
 
 class PerfectForecast:
-    """Oracle forecaster: returns the actual series aggregated to the MPC grid.
-
-    Same get_forecasts() interface as the other forecasters; used as the
-    perfect-information upper bound (former "ideal" pipeline).
-    """
+    """Perfect-information forecaster: actuals aggregated to the MPC grid."""
 
     def __init__(self,
                  load_kw_s: Union[pd.Series, pd.DataFrame],
@@ -171,10 +155,7 @@ class PerfectForecast:
 
 
 class HybridForecast:
-    """Composition: one forecaster on the fine (dt1) steps, another on the coarse steps.
-
-    Typical use: HybridForecast(fine=ForecastMPC(...), coarse=PrototypeForecast(...)).
-    """
+    """One forecaster on the fine (dt1) steps, another on the coarse ones."""
 
     def __init__(self, fine, coarse) -> None:
         self.fine = fine

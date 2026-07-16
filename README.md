@@ -32,9 +32,11 @@ discharge efficiencies:
 
 $$E_{t+1} = E_t + \Delta t \left( \eta_c\, P^{\mathrm{ch}}_t - \tfrac{1}{\eta_d}\, P^{\mathrm{dis}}_t \right),\qquad (1-\mathrm{DoD})\,E_{\mathrm{nom}} \le E_t \le E_{\mathrm{nom}}$$
 
-**Power balance.** The command is reconciled against the actual load/PV; any
-residual is covered by the grid (on-grid) or by shedding/curtailment, in 10%
-steps, until balanced.
+**Power balance.** The command is reconciled against the actual load/PV
+following a physical merit order: grid import up to its cap, then interrupting
+battery charging, then dispatching available battery discharge (bounded by
+power, ramp and stored energy) — load shedding, at value-of-lost-load, is the
+last resort. Surpluses go to grid export and then PV curtailment.
 
 **Two operating modes**, driven by the outage state:
 - *On-grid*: the controller's command is applied; the grid absorbs the residual.
@@ -87,7 +89,7 @@ Key attributes the controllers read: `env.timestamp`, `env.mode`, `env.E_meas`
 
 ---
 
-## 2. Sizing — [`1-sizing.py`](1-sizing.py), [`sizing/`](sizing/)
+## 2. Sizing — [`experiments/01_sizing.py`](experiments/01_sizing.py), [`sizing/`](sizing/)
 
 A **two-stage stochastic program** that picks the PV peak power
 $\hat P^{\mathrm{PV}}$ and BESS energy $\hat E^{\mathrm{BESS}}$ minimizing capital
@@ -121,7 +123,7 @@ and BESS degradation over scenarios $s$ and contingencies $c$.
 ### How to run
 
 ```bash
-python 1-sizing.py
+python experiments/01_sizing.py
 ```
 
 Runs two cases (with / without degradation) and writes decision variables,
@@ -199,21 +201,34 @@ from opt import simulate_mpc, simulate_stochastic
 from forecasting import PerfectForecast
 
 simulate_mpc(params, PerfectForecast(load_s, pv_s), start, n_iters, out_dir)
-simulate_stochastic(params, start, n_iters, out_dir)  # solve once, run open-loop
+simulate_stochastic(params, start, n_iters, out_dir)  # receding plan, re-solved daily
 ```
 
 ### Experiments
 
+All experiment entry points live in [`experiments/`](experiments/), numbered in
+the natural run order. Run them from the repo root, e.g.
+`python experiments/01_sizing.py`.
+
 | Script | Purpose |
 |---|---|
-| [`2-forecast_eval.py`](2-forecast_eval.py) | offline forecast quality (prototypes vs naive vs LSTM); resumable via checkpoint |
-| [`3-forecaster_comparison.py`](3-forecaster_comparison.py) | operation: ideal vs stochastic vs LSTM vs prototype vs hybrid |
-| [`4-sized_system.py`](4-sized_system.py) | same comparison on the *sized* system (closes the planning → operation loop) |
-| [`5-mesh_sweep.py`](5-mesh_sweep.py) | sweep of the time mesh $(h, \Delta t_1, \Delta t_2)$ |
-| [`6-robustness.py`](6-robustness.py) | actuator noise, outage probability and seeds |
+| [`01_sizing.py`](experiments/01_sizing.py) | PV/BESS sizing with and without degradation |
+| [`02_forecast_eval.py`](experiments/02_forecast_eval.py) | offline forecast quality (prototypes vs naive vs LSTM) |
+| [`03_forecaster_comparison.py`](experiments/03_forecaster_comparison.py) | operation: ideal vs stochastic vs LSTM vs prototype vs hybrid |
+| [`04_sized_system.py`](experiments/04_sized_system.py) | same comparison on the *sized* system |
+| [`05_mesh_sweep.py`](experiments/05_mesh_sweep.py) | time-mesh grid search $(h, \Delta t_1, \Delta t_2)$ |
+| [`06_robustness.py`](experiments/06_robustness.py) | actuator noise, outage probability and seeds |
+| [`07_seasonal.py`](experiments/07_seasonal.py) | monthly windows across the test year |
+| [`08_t2_refinement.py`](experiments/08_t2_refinement.py) | extra $\Delta t_2$ points on the Pareto line |
+| [`09_mesh_seasonal.py`](experiments/09_mesh_seasonal.py) | full mesh grid in three more seasons |
+| [`10_recourse.py`](experiments/10_recourse.py) | stochastic re-solve frequency sweep |
+| [`11_champion.py`](experiments/11_champion.py) | LSTM/hybrid on the best mesh |
 
-Each writes a `summary.csv` under `Results/<experiment>/`. Configuration is
-plain constants at the top of each script — no CLI flags.
+Each writes a `summary.csv` under `Results/<experiment>/`, saves per-case
+artifacts, and skips cases already completed (resume). Configuration is plain
+constants at the top of each script — no CLI flags. Figures and tables are
+rebuilt from the summaries by `scripts/make_figures.py` and
+`scripts/make_tables.py`.
 
 ---
 

@@ -1,9 +1,17 @@
+"""PV/BESS sizing over 25 years, with and without battery degradation.
+
+Outputs go to Results/sizing/. Run from the repo root.
+"""
+
 import json
+import sys
 from copy import deepcopy
 from pathlib import Path
 
 import pandas as pd
 import pyomo.environ as pyo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sizing import MicrogridDesign
 
@@ -13,8 +21,6 @@ except ImportError:  # pragma: no cover - optional dependency for plotting only
     plt = None
 
 
-# Solver: escolhido automaticamente (Gurobi se disponivel, senao HiGHS); LPs
-# grandes como este usam barrier/IPM sem crossover — ver opt.utils.solve_model.
 SOLVER_TIME_LIMIT_S = 3600
 SOLVER_THREADS = 8
 

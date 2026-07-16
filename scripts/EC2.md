@@ -20,15 +20,15 @@ experimento, sem argumentos nem env vars** — toda a configuração são
 constantes maiúsculas no topo de cada arquivo:
 
 ```bash
-python 1-sizing.py                  # dimensionamento (com/sem degradação)
-python 2-forecast_eval.py           # E0: avaliação de previsão (leve)
-python 3-forecaster_comparison.py   # E1: ideal/estocástico/lstm/prototype/hybrid
-python 4-sized_system.py            # E2: idem no sistema dimensionado
-python 5-mesh_sweep.py              # E3: sweep da malha (h x dt1 x dt2, paralelo)
-python 6-robustness.py              # E4: ruído/outage/seeds (após E1/E3)
+python experiments/01_sizing.py                  # dimensionamento (com/sem degradação)
+python experiments/02_forecast_eval.py           # E0: avaliação de previsão (leve)
+python experiments/03_forecaster_comparison.py   # E1: ideal/estocástico/lstm/prototype/hybrid
+python experiments/04_sized_system.py            # E2: idem no sistema dimensionado
+python experiments/05_mesh_sweep.py              # E3: sweep da malha (h x dt1 x dt2, paralelo)
+python experiments/06_robustness.py              # E4: ruído/outage/seeds (após E1/E3)
 ```
 
-- Paralelismo do sweep: constante `WORKERS` no topo de `5-mesh_sweep.py`
+- Paralelismo do sweep: constante `WORKERS` no topo de `experiments/05_mesh_sweep.py`
   (1 thread de solver por processo).
 - Cada caso salva `parameters_used.json`, `outage_calendar.json`,
   `operation_final.csv` e `metrics.json`; cada experimento salva um

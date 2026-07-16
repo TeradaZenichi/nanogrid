@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""
-Online stochastic operation using train clusters from sizing.
+"""Scenario-based operation model over (time, scenario, contingency).
 
-Key idea:
-- Build a stochastic model over (time, scenario, contingency) for operation only.
-- Use one shared control trajectory over time (P_bess, X_L, X_PV) for all scenarios.
-- Solve once, cache actions internally, then serve controls online without rebuilding.
+A single shared control trajectory is optimized for all scenarios, cached,
+and served by timestamp; the operation layer re-solves periodically.
+Scenarios come from the same train clusters used by the sizing model.
 """
 
 from __future__ import annotations
 
+import bisect
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -353,7 +352,8 @@ class OnGridStochasticOperation:
         self._meta: Dict[str, Any] = {}
 
         self._actions: List[Dict[str, float]] = []
-        self._action_cursor: int = 0
+        self._action_times: List[pd.Timestamp] = []
+        self._plan_end: pd.Timestamp | None = None
         self._has_loaded_solution = False
 
     def build(
@@ -456,8 +456,7 @@ class OnGridStochasticOperation:
             m.T, rule=lambda _m, t: _m.P_ch[t] <= (e_max - _m.E[t]) / (_m.eta_c * _m.dt_h[t])
         )
         if self.relaxation:
-            # Pozo et al. Extn-LP (Formulation 5), same as the sizing model:
-            # affine coupling P_ch + P_dis <= P_max replaces the binary mode.
+            # Extn-LP (Pozo et al. F5): P_ch + P_dis <= P_max instead of a binary.
             m.ChargeLimit = Constraint(m.T, rule=lambda _m, t: _m.P_ch[t] <= _m.P_ch_max)
             m.DischargeLimit = Constraint(m.T, rule=lambda _m, t: _m.P_dis[t] <= _m.P_dis_max)
             m.RelaxCoupling = Constraint(
@@ -594,7 +593,8 @@ class OnGridStochasticOperation:
 
         self.model = m
         self._actions = []
-        self._action_cursor = 0
+        self._action_times = []
+        self._plan_end = None
         self._has_loaded_solution = False
         self._meta = {
             "split": self.library.split,
@@ -626,29 +626,32 @@ class OnGridStochasticOperation:
             self._cache_actions()
         else:
             self._actions = []
-            self._action_cursor = 0
+            self._action_times = []
+            self._plan_end = None
         return self.results
 
     def _cache_actions(self) -> None:
         if self.model is None or not self._has_loaded_solution or not self._times:
             self._actions = []
-            self._action_cursor = 0
+            self._action_times = []
+            self._plan_end = None
             return
 
         m = self.model
         self._actions = []
         for t in self._times:
+            # Execute the c0 branch (expectation over scenarios only). Averaging
+            # the contingency branches into X_L would shed load while on-grid.
             expected_gin = 0.0
             expected_gout = 0.0
             expected_xl = 0.0
             expected_xpv = 0.0
             for s in m.S:
-                for c in m.C:
-                    w = float(value(m.piS[s])) * float(value(m.piC[c]))
-                    expected_gin += w * float(value(m.P_gin[t, s, c]))
-                    expected_gout += w * float(value(m.P_gout[t, s, c]))
-                    expected_xl += w * float(value(m.X_L[t, s, c]))
-                    expected_xpv += w * float(value(m.X_PV[t, s, c]))
+                w = float(value(m.piS[s]))
+                expected_gin += w * float(value(m.P_gin[t, s, "c0"]))
+                expected_gout += w * float(value(m.P_gout[t, s, "c0"]))
+                expected_xl += w * float(value(m.X_L[t, s, "c0"]))
+                expected_xpv += w * float(value(m.X_PV[t, s, "c0"]))
 
             self._actions.append(
                 {
@@ -668,24 +671,24 @@ class OnGridStochasticOperation:
                     "obj": float(value(m.Objective)),
                 }
             )
-        self._action_cursor = 0
 
-    def reset_cursor(self) -> None:
-        self._action_cursor = 0
+        # Each action is valid over its model timestep.
+        self._action_times = [pd.Timestamp(t) for t in self._times]
+        last_dt = (
+            self._times[-1] - self._times[-2]
+            if len(self._times) >= 2
+            else timedelta(minutes=5)
+        )
+        self._plan_end = pd.Timestamp(self._times[-1] + last_dt)
 
-    def get_control(self, step: int | None = None, advance: bool = True) -> Dict[str, float]:
-        if not self._actions:
+    def get_control_at(self, now) -> Dict[str, float]:
+        """Cached action whose timestep covers `now`; {} outside the plan window."""
+        if not self._actions or self._plan_end is None:
             return {}
-        if step is None:
-            idx = self._action_cursor
-            if idx >= len(self._actions):
-                idx = len(self._actions) - 1
-            action = dict(self._actions[idx])
-            if advance and self._action_cursor < len(self._actions):
-                self._action_cursor += 1
-            return action
-
-        idx = max(0, min(int(step), len(self._actions) - 1))
+        now = pd.Timestamp(now)
+        if now < self._action_times[0] or now >= self._plan_end:
+            return {}
+        idx = bisect.bisect_right(self._action_times, now) - 1
         return dict(self._actions[idx])
 
     def extract_first_step(self, scenario: Any | None = None, contingency: str = "c0") -> Dict[str, float]:

@@ -40,13 +40,13 @@ python -c "from opt.utils import detect_solver; print(detect_solver())"
 ## 5. Rodar o experimento
 
 ```bash
-python 1-sizing.py
+python experiments/01_sizing.py
 ```
 
 Ou encadear vários em sequência:
 
 ```bash
-python 1-sizing.py && python 2-forecast_eval.py
+python experiments/01_sizing.py; python experiments/02_forecast_eval.py
 ```
 
 ## 6. Soltar a sessão (deixar rodando) e fechar o navegador
@@ -87,4 +87,4 @@ tmux ls                     # (se esqueceu o nome) lista as sessões
 2. **tmux protege contra desconexão, não contra a instância ser parada.**
    Se houver auto-shutdown por ociosidade, desative-o antes de runs longas
    (Notebook instance → Lifecycle configuration). Mesmo assim, o
-   `2-forecast_eval.py` retoma de onde parou pelo checkpoint.
+   `experiments/02_forecast_eval.py` retoma de onde parou pelo checkpoint.
