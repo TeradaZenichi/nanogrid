@@ -1,6 +1,7 @@
 """PV/BESS sizing over 25 years, with and without battery degradation.
 
-Outputs go to Results/sizing/. Run from the repo root.
+Outputs go to Results/sizing/, including a Gulliver-font PDF report.
+Run from the repo root.
 """
 
 import json
@@ -10,19 +11,40 @@ from pathlib import Path
 
 import pandas as pd
 import pyomo.environ as pyo
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from matplotlib.backends.backend_pdf import PdfPages
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sizing import MicrogridDesign
 
-try:
-    import matplotlib.pyplot as plt
-except ImportError:  # pragma: no cover - optional dependency for plotting only
-    plt = None
-
-
 SOLVER_TIME_LIMIT_S = 3600
 SOLVER_THREADS = 8
+ROOT = Path(__file__).resolve().parents[1]
+GULLIVER_FONT_PATH = ROOT / "data" / "Gulliver.otf"
+
+
+def _configure_gulliver() -> str:
+    if not GULLIVER_FONT_PATH.exists():
+        raise FileNotFoundError(f"Gulliver font not found: {GULLIVER_FONT_PATH}")
+    font_manager.fontManager.addfont(str(GULLIVER_FONT_PATH))
+    family = font_manager.FontProperties(fname=str(GULLIVER_FONT_PATH)).get_name()
+    plt.rcParams.update(
+        {
+            "font.family": family,
+            "font.sans-serif": [family],
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    return family
+
+
+GULLIVER_FONT_FAMILY = _configure_gulliver()
 
 
 def _to_year_map(year_data):
@@ -70,15 +92,29 @@ def _extract_operation_rows(design: MicrogridDesign, yearly_capacity: dict[int, 
                             "gamma_BESS_c": (_safe(m.gamma_BESS_c[t, s, c, y]) if has_gamma else None),
                             "gamma_BESS_d": (_safe(m.gamma_BESS_d[t, s, c, y]) if has_gamma else None),
                             "E_BESS_year_kwh": yearly_capacity.get(y_int),
+                            "E_BESS_init_year_kwh": _safe(m.E_BESS_init[y]),
+                            "initial_soc_fraction": (
+                                _safe(m.E_BESS_init[y]) / yearly_capacity[y_int]
+                                if yearly_capacity.get(y_int)
+                                else None
+                            ),
                         }
                     )
     return rows
 
 
+def _save_figure(fig, out_dir: Path, stem: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / f"{stem}.pdf"
+    png_path = out_dir / f"{stem}.png"
+    fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(png_path, bbox_inches="tight", dpi=180)
+    plt.close(fig)
+    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+        raise RuntimeError(f"Failed to generate PDF: {pdf_path}")
+
+
 def _save_plots(out_dir: Path, payload: dict, discount_rate: float) -> None:
-    if plt is None:
-        print("[sizing] matplotlib nao encontrado; pulando geracao de plots.")
-        return
 
     yearly_capacity = payload.get("bess_capacity_by_year_kwh", {}) or {}
     years = sorted(int(y) for y in yearly_capacity.keys())
@@ -86,14 +122,18 @@ def _save_plots(out_dir: Path, payload: dict, discount_rate: float) -> None:
 
     if years and caps:
         fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.plot(years, caps, marker="o", linewidth=2)
-        ax.set_title("BESS Capacity Along Years")
+        ax.plot(years, caps, marker="o", linewidth=2, label="Available capacity")
+        initial_map = payload.get("bess_initial_energy_by_year_kwh", {}) or {}
+        initial = [initial_map.get(y, initial_map.get(str(y))) for y in years]
+        if initial and all(value is not None for value in initial):
+            ax.plot(years, initial, marker="s", linewidth=1.8, label="Cyclic initial energy")
+            ax.legend(frameon=False)
+        ax.set_title("BESS capacity and cyclic initial energy")
         ax.set_xlabel("Year")
-        ax.set_ylabel("Capacity (kWh)")
+        ax.set_ylabel("Energy (kWh)")
         ax.grid(alpha=0.3)
         fig.tight_layout()
-        fig.savefig(out_dir / "bess_capacity_by_year.png", dpi=180)
-        plt.close(fig)
+        _save_figure(fig, out_dir, "bess_capacity_by_year")
 
     opex_by_year = payload.get("objective_breakdown", {}).get("OPEX_annual_by_year", {}) or {}
     opex_by_year = {int(k): float(v) for k, v in opex_by_year.items() if v is not None}
@@ -111,8 +151,86 @@ def _save_plots(out_dir: Path, payload: dict, discount_rate: float) -> None:
         ax.set_ylabel("Discounted OPEX")
         ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
-        fig.savefig(out_dir / "discounted_opex_by_year.png", dpi=180)
+        _save_figure(fig, out_dir, "discounted_opex_by_year")
+
+
+def _save_comparison_report(root: Path, comparison: dict, discount_rate: float) -> Path:
+    labels = ["No degradation", "With degradation"]
+    cases = [comparison["alpha_eq_0"], comparison["alpha_gt_0"]]
+    if not all(case.get("has_loaded_solution", True) for case in cases):
+        raise RuntimeError("Cannot generate the sizing PDF report without two loaded solutions")
+    pv = [case["decision_variables"]["P_hat_PV_kw"] for case in cases]
+    bess = [case["decision_variables"]["E_hat_BESS_kwh"] for case in cases]
+    capex = [case["objective_breakdown"]["CAPEX"] for case in cases]
+    objective = [case["objective_breakdown"]["Objective"] for case in cases]
+    colors = ["#4C78A8", "#F58518"]
+    report_path = root / "sizing_report.pdf"
+
+    with PdfPages(
+        report_path,
+        metadata={
+            "Title": "PV and BESS sizing report",
+            "Author": "UNICAMP",
+            "Subject": f"Sizing results rendered with {GULLIVER_FONT_FAMILY}",
+        },
+    ) as pdf:
+        fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.5))
+        for ax, values, title, ylabel in (
+            (axes[0, 0], pv, "Installed PV capacity", "kW"),
+            (axes[0, 1], bess, "Installed BESS capacity", "kWh"),
+            (axes[1, 0], capex, "CAPEX", "Cost"),
+            (axes[1, 1], objective, "Total discounted objective", "Cost"),
+        ):
+            bars = ax.bar(labels, values, color=colors)
+            ax.set_title(title)
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="y", alpha=0.25)
+            ax.set_ylim(0.0, 1.15 * max(values))
+            ax.bar_label(bars, fmt="%.3f", padding=3)
+        fig.suptitle("Degradation-aware residential energy system sizing", fontsize=16)
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        fig.savefig(root / "sizing_comparison_alpha.png", bbox_inches="tight", dpi=180)
         plt.close(fig)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.5), sharex=True)
+        for label, case, color in zip(labels, cases, colors):
+            capacity = _to_year_map(case.get("bess_capacity_by_year_kwh", {}))
+            initial = _to_year_map(case.get("bess_initial_energy_by_year_kwh", {}))
+            years = sorted(capacity)
+            axes[0].plot(years, [capacity[y] for y in years], marker="o", color=color, label=label)
+            axes[0].plot(
+                years,
+                [initial[y] for y in years],
+                linestyle="--",
+                marker="s",
+                color=color,
+                alpha=0.85,
+            )
+            annual = _to_year_map(case["objective_breakdown"].get("OPEX_annual_by_year", {}))
+            axes[1].plot(
+                years,
+                [annual[y] / ((1.0 + discount_rate) ** y) for y in years],
+                marker="o",
+                color=color,
+                label=label,
+            )
+        axes[0].set_title("Available capacity (solid) and cyclic initial energy (dashed)")
+        axes[0].set_ylabel("Energy (kWh)")
+        axes[0].legend(frameon=False)
+        axes[0].grid(alpha=0.25)
+        axes[1].set_title("Discounted OPEX by planning year")
+        axes[1].set_xlabel("Year")
+        axes[1].set_ylabel("Discounted OPEX")
+        axes[1].grid(alpha=0.25)
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        fig.savefig(root / "sizing_trajectories.png", bbox_inches="tight", dpi=180)
+        plt.close(fig)
+
+    if not report_path.exists() or report_path.stat().st_size == 0:
+        raise RuntimeError(f"Failed to generate sizing report: {report_path}")
+    return report_path
 
 
 def _run_case(params: dict, case_dir: Path, degradation_on: bool):
@@ -173,11 +291,34 @@ def _run_case(params: dict, case_dir: Path, degradation_on: bool):
         "decision_variables": {
             "P_hat_PV_kw": out.get("P_hat_PV_kw"),
             "E_hat_BESS_kwh": out.get("E_hat_BESS_kwh"),
+            "E_BESS_init_kwh": out.get("E_BESS_init_kwh"),
+            "BESS_initial_soc_fraction": out.get("BESS_initial_soc_fraction"),
             "E_BESS_min_life_kwh": out.get("E_BESS_min_life_kwh"),
         },
         "bess_capacity_by_year_kwh": yearly_capacity,
+        "bess_initial_energy_by_year_kwh": out.get("E_BESS_init_by_year_kwh", {}),
+        "bess_initial_soc_fraction_by_year": out.get("BESS_initial_soc_fraction_by_year", {}),
         "pv_retention_by_year": out.get("d_PV_y", {}),
         "E_BESS_max_over_years_kwh": max_capacity_years,
+        "model_audit": {
+            "cyclic_daily_soc": True,
+            "optimized_cyclic_initial_soc": True,
+            "cycle_closure_max_abs_kwh": out.get("BESS_cycle_closure_max_abs_kwh"),
+            "simultaneous_charge_discharge_max_kw": out.get(
+                "BESS_simultaneous_charge_discharge_max_kw"
+            ),
+            "simultaneous_charge_discharge_by_year_kw": out.get(
+                "BESS_simultaneous_charge_discharge_by_year_kw", {}
+            ),
+            "weighted_simultaneous_overlap_by_year_kwh_day": out.get(
+                "BESS_weighted_simultaneous_overlap_by_year_kwh_day", {}
+            ),
+        },
+        "artifacts": {
+            "capacity_pdf": (case_dir / "bess_capacity_by_year.pdf").as_posix(),
+            "discounted_opex_pdf": (case_dir / "discounted_opex_by_year.pdf").as_posix(),
+            "font": GULLIVER_FONT_FAMILY,
+        },
         "objective_breakdown": {
             "CAPEX": out.get("CAPEX"),
             "OPEX_day": out.get("OPEX_day"),
@@ -256,4 +397,21 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
 
+    discount_rate = float(params.get("sizing", {}).get("discount_rate", 0.08))
+    report_path = _save_comparison_report(root, comparison, discount_rate)
+    (root / "sizing_report_manifest.json").write_text(
+        json.dumps(
+            {
+                "report_pdf": report_path.as_posix(),
+                "font_family": GULLIVER_FONT_FAMILY,
+                "font_file": GULLIVER_FONT_PATH.as_posix(),
+                "model_version": 2,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
     print((root / "comparison_alpha_cases.json").as_posix())
+    print(report_path.as_posix())

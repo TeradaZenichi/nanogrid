@@ -49,6 +49,9 @@ Ou encadear vários em sequência:
 python experiments/01_sizing.py; python experiments/02_forecast_eval.py
 ```
 
+Não pule o experimento 01: a avaliação de previsão e o pipeline 12 exigem o
+artefato `Results/sizing/alpha_gt_0` com fechamento cíclico auditado.
+
 ## 6. Soltar a sessão (deixar rodando) e fechar o navegador
 
 Pressione, em sequência:

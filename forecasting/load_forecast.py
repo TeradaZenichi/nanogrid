@@ -29,6 +29,8 @@ from typing import Optional, Dict
 import numpy as np
 import pandas as pd
 
+from .causal import hourly_forecast_start, last_completed_hour
+
 # --------------------
 # Module configuration
 # --------------------
@@ -101,7 +103,7 @@ def _build_vstf_input(df5: pd.DataFrame, t_now: pd.Timestamp, lookback_steps: in
     return Xw[req].values.astype(np.float32)[np.newaxis, :, :]
 
 def _build_st_input(dfH: pd.DataFrame, anchor_hour: pd.Timestamp, lookback_steps: int) -> np.ndarray:
-    """End-aligned window for ST hourly input (anchor = next_full_hour - 1h)."""
+    """End-aligned window whose anchor is a fully observed hourly row."""
     req = ["p_norm", "dow_sin", "dow_cos", "hod_sin", "hod_cos"]
     anchor_hour = pd.Timestamp(anchor_hour).floor("h")
     idx_window = pd.date_range(end=anchor_hour, periods=lookback_steps, freq="h")
@@ -178,16 +180,17 @@ def load(
     v_pred = model_vstf.predict(X_v, verbose=0).reshape(-1)
     use_vstf_steps = int(min(cfg_v["horizon_steps"], len(v_pred), intervals))
 
-    # ST (hourly) anchored at next full hour
-    next_full_hour = (t_now + pd.Timedelta(minutes=5)).ceil("h")
-    anchor_hour = next_full_hour - pd.Timedelta(hours=1)
+    # ST (hourly) uses only fully completed, left-labelled hourly rows.
+    anchor_hour = last_completed_hour(t_now)
     X_h = _build_st_input(_DFH, anchor_hour, cfg_h["lookback_steps"])
     st_pred = model_st.predict(X_h, verbose=0).reshape(-1)
 
     # Determine hours needed to cover `intervals`
     hours_needed = int(np.ceil(intervals / 12.0))
     st_pred = st_pred[:max(hours_needed, 1)]
-    st_times = pd.date_range(start=next_full_hour, periods=len(st_pred), freq="h")
+    st_times = pd.date_range(
+        start=hourly_forecast_start(anchor_hour), periods=len(st_pred), freq="h"
+    )
     st_hourly = pd.Series(st_pred, index=st_times)
 
     # Interpolate to 5-min grid and combine

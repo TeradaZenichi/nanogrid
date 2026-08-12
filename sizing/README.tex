@@ -7,11 +7,18 @@
 \geometry{margin=2.2cm}
 
 \title{Sizing Estocastico -- Modelo em \texttt{sizing/\_\_init\_\_.py}}
-\author{Nanogrid}
+\author{Residential PV--BESS system}
 \date{\today}
 
 \begin{document}
 \maketitle
+
+\begin{quote}
+\textbf{Implementation note.} The current sizing model is a pure Extn-LP with
+year-indexed degradation and cyclic representative-day energy closure. The
+article formulation in \texttt{paper/main.tex} is the authoritative equation
+set; this file is retained as a compact implementation guide.
+\end{quote}
 
 \section{Objetivo}
 Este documento resume o modelo de \emph{sizing} implementado em
@@ -42,11 +49,8 @@ P_{t,s,c}^{\text{EDS,out}},\;
 P_{t,s,c}^{\text{PV,curt}},\;
 P_{t,s,c}^{\text{L,shed}}
 \end{align}
-com binarias de modo:
-\begin{align}
-\gamma_{t,s,c}^{\text{BESS,c}},\;
-\gamma_{t,s,c}^{\text{BESS,d}} \in \{0,1\}.
-\end{align}
+The implemented Extn-LP formulation does not use binary charge/discharge mode
+variables.
 
 \section{Perfis normalizados}
 \begin{align}
@@ -73,17 +77,41 @@ E_{t,s,c}^{\text{BESS}} +
 \right).
 \end{align}
 
-\subsection*{Exclusividade carga/descarga}
+The initial energy $E_y^{0}$ is a common optimization variable shared by all
+representative and contingency scenarios:
 \begin{align}
-\gamma_{t,s,c}^{\text{BESS,c}} + \gamma_{t,s,c}^{\text{BESS,d}} \le 1.
+(1-\text{DoD}^{\text{BESS}})E_y^{\text{BESS}}
+\le E_y^0 \le E_y^{\text{BESS}}, \qquad
+E_{t_0,s,c,y}^{\text{BESS}}=E_y^0.
+\end{align}
+For the first and last periods of every representative day, the final action
+is propagated and the energy cycle is closed:
+\begin{align}
+E_y^0 = E_{t_f,s,c,y}^{\text{BESS}} +
+\Delta t_{t_f}\left(
+\eta^{\text{BESS,c}}P_{t_f,s,c,y}^{\text{BESS,c}}-
+\frac{P_{t_f,s,c,y}^{\text{BESS,d}}}{\eta^{\text{BESS,d}}}
+\right).
+\end{align}
+
+\subsection*{Acoplamento continuo carga/descarga}
+\begin{align}
+P_{t,s,c,y}^{\text{BESS,d}}
+\le \kappa^{\text{BESS}}E_y^{\text{BESS}}
+-P_{t,s,c,y}^{\text{BESS,c}}.
 \end{align}
 
 \subsection*{Limites da BESS (C-rate simetrico)}
 \begin{align}
 0 \le P_{t,s,c}^{\text{BESS,c}} &\le \kappa^{\text{BESS}}\hat{E}^{\text{BESS}}\\
 0 \le P_{t,s,c}^{\text{BESS,d}} &\le \kappa^{\text{BESS}}\hat{E}^{\text{BESS}}\\
-P_{t,s,c}^{\text{BESS,c}} &\le \kappa^{\text{BESS}}E_{\max}^{\text{BESS}}\gamma_{t,s,c}^{\text{BESS,c}}\\
-P_{t,s,c}^{\text{BESS,d}} &\le \kappa^{\text{BESS}}E_{\max}^{\text{BESS}}\gamma_{t,s,c}^{\text{BESS,d}}\\
+P_{t,s,c,y}^{\text{BESS,c}}
+&\le \frac{E_y^{\text{BESS}}-E_{t,s,c,y}^{\text{BESS}}}
+{\eta^{\text{BESS,c}}\Delta t_t}\\
+P_{t,s,c,y}^{\text{BESS,d}}
+&\le \frac{\eta^{\text{BESS,d}}
+\left(E_{t,s,c,y}^{\text{BESS}}-(1-\text{DoD}^{\text{BESS}})
+E_y^{\text{BESS}}\right)}{\Delta t_t}\\
 (1-\text{DoD}^{\text{BESS}})\hat{E}^{\text{BESS}} &\le E_{t,s,c}^{\text{BESS}} \le \hat{E}^{\text{BESS}}.
 \end{align}
 

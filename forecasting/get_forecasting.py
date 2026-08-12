@@ -9,6 +9,7 @@ from tensorflow.keras.models import load_model
 
 from opt.utils import slice_forecasts, build_time_grid
 import forecasting
+from forecasting.causal import FORECAST_ASSEMBLY_VERSION
 
 
 DEFAULT_PATHS: Dict[str, str] = {
@@ -105,6 +106,8 @@ def get_window(start_dt0: pd.Timestamp,
 
 
 class ForecastMPC:
+    forecast_version = FORECAST_ASSEMBLY_VERSION
+
     def __init__(self,
                  params: Optional[Dict[str, Any]],
                  load_kw_s: Union[pd.Series, pd.DataFrame],

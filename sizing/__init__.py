@@ -151,11 +151,6 @@ class Parameters:
             emax = float(self.bess_cfg.get("Emax_kwh", 0.0))
             self.kappa_bess_per_h = (pmax / emax) if emax > 0 else 0.0
 
-        e_init_kwh = float(self.bess_cfg.get("E_init_kwh", self.bess_cfg.get("Emax_kwh", 0.0)))
-        e_nom_kwh = float(self.bess_cfg.get("Emax_kwh", 0.0))
-        self.e_init_frac = (e_init_kwh / e_nom_kwh) if e_nom_kwh > 0 else 0.5
-        self.e_init_frac = min(max(self.e_init_frac, 0.0), 1.0)
-
         self.outage_probability = float(self.eds_cfg.get("outage_probability_pct", 0.0)) / 100.0
         self.outage_duration_h = float(self.eds_cfg.get("outage_duration_hours", 0.0))
         self.contingency_step_slots = int(self.sizing_cfg.get("contingency_step_slots", 1))
@@ -204,7 +199,7 @@ class Parameters:
 
         self.default_split = str(self.sizing_cfg.get("split", "train"))
         self.max_time_slots = self.sizing_cfg.get("max_time_slots")
-        self.include_zero_prob_scenarios = bool(self.sizing_cfg.get("include_zero_prob_scenarios", True))
+        self.include_zero_prob_scenarios = bool(self.sizing_cfg.get("include_zero_prob_scenarios", False))
 
     def c_eds_at_slot(self, slot: int, dt_h: float) -> float:
         hour = int((slot * dt_h) % 24)
@@ -293,8 +288,6 @@ class Parameters:
         model.eta_BESS_d = pyo.Param(initialize=self.eta_bess_d)
         model.DoD_BESS = pyo.Param(initialize=self.dod_frac)
         model.kappa_BESS = pyo.Param(initialize=max(0.0, self.kappa_bess_per_h))
-        model.E_init_frac = pyo.Param(initialize=self.e_init_frac)
-
         model.days_per_year = pyo.Param(initialize=self.days_per_year)
         model.discount_rate = pyo.Param(initialize=max(0.0, self.discount_rate))
         model.alpha_BESS_cal = pyo.Param(initialize=max(0.0, self.bess_calendar_fade_per_year))
@@ -415,13 +408,14 @@ class BESS:
             bounds=(0.0, max(0.0, self.param.bess_size_max_kwh)),
         )
         model.E_BESS_year = pyo.Var(model.Y, domain=pyo.NonNegativeReals)
-        model.E_BESS_min_life = pyo.Var(domain=pyo.NonNegativeReals)
+        model.E_BESS_init = pyo.Var(model.Y, domain=pyo.NonNegativeReals)
 
         model.P_BESS_c = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
         model.P_BESS_d = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
         model.E_BESS = pyo.Var(model.T, model.S, model.C, model.Y, domain=pyo.NonNegativeReals)
 
         first_t = model.T.first()
+        last_t = model.T.last()
 
         model.BESSDynamics = pyo.Constraint(
             model.TRANS,
@@ -440,7 +434,37 @@ class BESS:
             model.S,
             model.C,
             model.Y,
-            rule=lambda m, s, c, y: m.E_BESS[first_t, s, c, y] == m.E_init_frac * m.E_BESS_year[y],
+            rule=lambda m, s, c, y: m.E_BESS[first_t, s, c, y] == m.E_BESS_init[y],
+        )
+        model.BESSInitLo = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: m.E_BESS_init[y] >= (1.0 - m.DoD_BESS) * m.E_BESS_year[y],
+        )
+        model.BESSInitHi = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: m.E_BESS_init[y] <= m.E_BESS_year[y],
+        )
+        # The initial stored energy is common to every representative and
+        # contingency branch, but optimized instead of fixed at the catalog
+        # initial SoC. This lets the schedule reserve energy before late
+        # outages while preserving a physically cyclic representative day.
+        model.E_BESS_terminal = pyo.Expression(
+            model.S,
+            model.C,
+            model.Y,
+            rule=lambda m, s, c, y: m.E_BESS[last_t, s, c, y]
+            + m.dt_h[last_t]
+            * (
+                m.eta_BESS_c * m.P_BESS_c[last_t, s, c, y]
+                - (1.0 / m.eta_BESS_d) * m.P_BESS_d[last_t, s, c, y]
+            ),
+        )
+        model.BESSCycleClosure = pyo.Constraint(
+            model.S,
+            model.C,
+            model.Y,
+            rule=lambda m, s, c, y: m.E_BESS_terminal[s, c, y]
+            == m.E_BESS_init[y],
         )
 
         model.BESSThroughputDay = pyo.Expression(
@@ -473,12 +497,6 @@ class BESS:
             model.Y,
             rule=lambda m, y: m.E_BESS_year[y] >= m.E_BESS_EOL_frac * m.E_hat_BESS,
         )
-        model.BESSMinLifeUpper = pyo.Constraint(
-            model.Y,
-            rule=lambda m, y: m.E_BESS_min_life <= m.E_BESS_year[y],
-        )
-        model.BESSMinLifeLower = pyo.Constraint(expr=model.E_BESS_min_life >= model.E_BESS_EOL_frac * model.E_hat_BESS)
-        model.BESSMinLifeCap = pyo.Constraint(expr=model.E_BESS_min_life <= model.E_hat_BESS)
 
         model.BESSChargeCRate = pyo.Constraint(
             model.T,
@@ -816,6 +834,12 @@ class MicrogridDesign:
             "alpha_PV_year1": self.param.pv_degradation_year1_frac,
             "alpha_PV_linear": self.param.pv_degradation_linear_frac,
             "d_PV_y": {int(y): self.param.pv_retention_factor(int(y)) for y in self.model.Y},
+            "pi_s": bundle["pi_s"],
+            "pi_c": bundle["pi_c"],
+            "cyclic_daily_soc": True,
+            "optimized_cyclic_initial_soc": True,
+            "positive_probability_scenarios_only": not self.param.include_zero_prob_scenarios,
+            "sizing_model_version": 2,
         }
         return m
 
@@ -851,11 +875,58 @@ class MicrogridDesign:
 
         m = self.model
         first_y = m.Y.first()
+        yearly_capacity = {int(y): _safe(m.E_BESS_year[y]) for y in m.Y}
+        yearly_initial_energy = {int(y): _safe(m.E_BESS_init[y]) for y in m.Y}
+        yearly_initial_soc = {
+            int(y): (
+                yearly_initial_energy[int(y)] / yearly_capacity[int(y)]
+                if yearly_initial_energy[int(y)] is not None
+                and yearly_capacity[int(y)] is not None
+                and yearly_capacity[int(y)] > 0.0
+                else None
+            )
+            for y in m.Y
+        }
+        valid_capacity = [v for v in yearly_capacity.values() if v is not None]
+        cycle_residuals = [_safe(con.body) for con in m.BESSCycleClosure.values()]
+        valid_cycle_residuals = [abs(v) for v in cycle_residuals if v is not None]
+        simultaneous_max_by_year = {}
+        simultaneous_weighted_by_year = {}
+        for y in m.Y:
+            max_overlap = 0.0
+            weighted_overlap = 0.0
+            for t in m.T:
+                for s in m.S:
+                    for c in m.C:
+                        weight = float(pyo.value(m.pi_s[s] * m.pi_c[c]))
+                        if weight <= 0.0:
+                            continue
+                        charge = _safe(m.P_BESS_c[t, s, c, y])
+                        discharge = _safe(m.P_BESS_d[t, s, c, y])
+                        if charge is None or discharge is None:
+                            continue
+                        overlap = min(charge, discharge)
+                        max_overlap = max(max_overlap, overlap)
+                        weighted_overlap += weight * float(pyo.value(m.dt_h[t])) * overlap
+            simultaneous_max_by_year[int(y)] = max_overlap
+            simultaneous_weighted_by_year[int(y)] = weighted_overlap
         return {
             "P_hat_PV_kw": _safe(m.P_hat_PV),
             "E_hat_BESS_kwh": _safe(m.E_hat_BESS),
-            "E_BESS_min_life_kwh": _safe(m.E_BESS_min_life),
-            "E_BESS_year_kwh": {int(y): _safe(m.E_BESS_year[y]) for y in m.Y},
+            "E_BESS_init_kwh": yearly_initial_energy[int(first_y)],
+            "E_BESS_init_by_year_kwh": yearly_initial_energy,
+            "BESS_initial_soc_fraction": yearly_initial_soc[int(first_y)],
+            "BESS_initial_soc_fraction_by_year": yearly_initial_soc,
+            "E_BESS_min_life_kwh": min(valid_capacity) if valid_capacity else None,
+            "E_BESS_year_kwh": yearly_capacity,
+            "BESS_cycle_closure_max_abs_kwh": (
+                max(valid_cycle_residuals) if valid_cycle_residuals else None
+            ),
+            "BESS_simultaneous_charge_discharge_max_kw": (
+                max(simultaneous_max_by_year.values()) if simultaneous_max_by_year else None
+            ),
+            "BESS_simultaneous_charge_discharge_by_year_kw": simultaneous_max_by_year,
+            "BESS_weighted_simultaneous_overlap_by_year_kwh_day": simultaneous_weighted_by_year,
             "d_PV_y": {int(y): _safe(m.d_PV_y[y]) for y in m.Y},
             "CAPEX": _safe(m.CAPEX),
             "OPEX_day": _safe(m.OPEX_day[first_y]),

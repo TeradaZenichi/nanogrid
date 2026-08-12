@@ -15,24 +15,24 @@ export GRB_WLSACCESSID=... GRB_WLSSECRET=... GRB_LICENSEID=...
 python -c "import gurobipy; gurobipy.Model()"   # smoke test da licença
 ```
 
-Execução (dentro de `tmux` para sobreviver à desconexão): **um main por
-experimento, sem argumentos nem env vars** — toda a configuração são
-constantes maiúsculas no topo de cada arquivo:
+Execução dentro de `tmux` para sobreviver à desconexão:
 
 ```bash
 python experiments/01_sizing.py                  # dimensionamento (com/sem degradação)
+python experiments/01_1_sizing.py                # sensibilidade do dimensionamento
 python experiments/02_forecast_eval.py           # E0: avaliação de previsão (leve)
-python experiments/03_forecaster_comparison.py   # E1: ideal/estocástico/lstm/prototype/hybrid
-python experiments/04_sized_system.py            # E2: idem no sistema dimensionado
-python experiments/05_mesh_sweep.py              # E3: sweep da malha (h x dt1 x dt2, paralelo)
-python experiments/06_robustness.py              # E4: ruído/outage/seeds (após E1/E3)
+python experiments/12_corrected_pipeline.py --stage causal-pilot --workers 4
+python experiments/12_corrected_pipeline.py --stage all --workers 4
 ```
 
-- Paralelismo do sweep: constante `WORKERS` no topo de `experiments/05_mesh_sweep.py`
-  (1 thread de solver por processo).
+O experimento 01 é uma dependência obrigatória: previsão e operação carregam
+`Results/sizing/alpha_gt_0` e recusam parâmetros de catálogo ou artefatos
+anteriores ao fechamento cíclico do SoC.
+
+- Paralelismo: argumento `--workers` do pipeline 12.
 - Cada caso salva `parameters_used.json`, `outage_calendar.json`,
   `operation_final.csv` e `metrics.json`; cada experimento salva um
-  `summary.csv` no seu `Results/<experimento>/`.
+  `summary.csv` no diretório do estágio em `Results`.
 - Mesmos outages entre estratégias de um experimento por construção
   (`EDS.seed` em `data/parameters.json` — não alterar entre runs comparados).
 - **Instância burstable (t2/t3)**: CPU sustentada esgota créditos e afoga

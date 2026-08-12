@@ -12,6 +12,8 @@ Includes:
 - helpers for capturing/saving results
 """
 import json
+import hashlib
+import math
 import os
 import re
 from copy import deepcopy
@@ -27,6 +29,8 @@ import pandas as pd
 # ---------------------------
 
 _DETECTED_SOLVER: Optional[str] = None
+DEFAULT_SIZING_CASE = 'alpha_gt_0'
+DEFAULT_OPERATION_YEAR = 1
 
 
 def detect_solver() -> str:
@@ -130,8 +134,8 @@ def apply_sizing_case(params: Dict[str, Any],
                       results_root: str = "Results/sizing") -> Dict[str, Any]:
     """Copy of `params` with PV/BESS capacities taken from a sizing case.
 
-    Pmax, ramp and E_init are rescaled keeping their original ratios to
-    Emax_kwh (C-rate, ramp/Pmax, initial SoC).
+    Pmax and ramp are rescaled from the catalog ratios. The initial stored
+    energy is transferred directly from the optimized cyclic sizing state.
     """
     path = Path(results_root) / case / "sizing_decision_variables.json"
     if not path.exists():
@@ -140,30 +144,95 @@ def apply_sizing_case(params: Dict[str, Any],
     dv = data.get("decision_variables", {}) or {}
     p_pv = dv.get("P_hat_PV_kw")
     e_bess = dv.get("E_hat_BESS_kwh")
-    if p_pv is None or e_bess is None:
-        raise ValueError(f"Sizing case '{case}' has no P_hat_PV_kw/E_hat_BESS_kwh in {path}")
+    e_init = dv.get("E_BESS_init_kwh")
+    if p_pv is None or e_bess is None or e_init is None:
+        raise ValueError(
+            f"Sizing case '{case}' has no P_hat_PV_kw/E_hat_BESS_kwh/E_BESS_init_kwh in {path}"
+        )
 
     out = deepcopy(params)
     bess = out["BESS"]
     e_old = float(bess["Emax_kwh"])
     p_old = float(bess["Pmax_kw"])
     e_new = float(e_bess)
+    e_init_new = float(e_init)
+    if not 0.0 <= e_init_new <= e_new:
+        raise ValueError(
+            f"Sizing case '{case}' has invalid cyclic initial energy: "
+            f"E_init={e_init_new}, Emax={e_new}"
+        )
 
     out["PV"]["Pmax_kw"] = float(p_pv)
     bess["Emax_kwh"] = e_new
     bess["Pmax_kw"] = (p_old / e_old) * e_new  # preserve C-rate
     if bess.get("ramp_kw_per_step") is not None:
         bess["ramp_kw_per_step"] = (float(bess["ramp_kw_per_step"]) / p_old) * bess["Pmax_kw"]
-    if bess.get("E_init_kwh") is not None:
-        bess["E_init_kwh"] = (float(bess["E_init_kwh"]) / e_old) * e_new  # preserve initial SoC
+    bess["E_init_kwh"] = e_init_new
 
     out["sizing_case_applied"] = {
         "case": case,
         "source": path.as_posix(),
         "P_hat_PV_kw": float(p_pv),
         "E_hat_BESS_kwh": e_new,
+        "E_BESS_init_kwh": e_init_new,
+        "BESS_initial_soc_fraction": (e_init_new / e_new) if e_new > 0.0 else 0.0,
         "BESS_Pmax_kw": float(bess["Pmax_kw"]),
     }
+    return out
+
+
+def load_sized_parameters(params_json: str = 'data/parameters.json',
+                          case: str = DEFAULT_SIZING_CASE,
+                          results_root: str = 'Results/sizing',
+                          operation_year: int = DEFAULT_OPERATION_YEAR) -> Dict[str, Any]:
+    '''Load catalog parameters and obligatorily apply a solved sizing case.
+
+    The current operational campaign is anchored at year 1. A different year
+    must be implemented explicitly instead of silently reusing initial
+    capacities.
+    '''
+    if int(operation_year) != 1:
+        raise NotImplementedError('Only operation_year=1 is currently supported')
+
+    params_path = Path(params_json)
+    if not params_path.exists():
+        raise FileNotFoundError(f'Parameter file not found: {params_path}')
+    sizing_path = Path(results_root) / case / 'sizing_decision_variables.json'
+    if not sizing_path.exists():
+        raise FileNotFoundError(
+            f'Sizing case {case!r} not found at {sizing_path}. Run experiments/01_sizing.py first.'
+        )
+    sizing_data = json.loads(sizing_path.read_text(encoding='utf-8'))
+    if not bool(sizing_data.get('has_loaded_solution', False)):
+        raise ValueError(f'Sizing case {case!r} has no loaded feasible solution: {sizing_path}')
+    if not bool((sizing_data.get('metadata', {}) or {}).get('cyclic_daily_soc', False)):
+        raise ValueError(
+            f'Sizing case {case!r} predates cyclic daily SoC closure: {sizing_path}. '
+            'Regenerate it with experiments/01_sizing.py.'
+        )
+    if not bool(
+        (sizing_data.get('metadata', {}) or {}).get('optimized_cyclic_initial_soc', False)
+    ):
+        raise ValueError(
+            f'Sizing case {case!r} predates optimized cyclic initial SoC: {sizing_path}. '
+            'Regenerate it with experiments/01_sizing.py.'
+        )
+    cycle_residual = (sizing_data.get('model_audit', {}) or {}).get(
+        'cycle_closure_max_abs_kwh'
+    )
+    if cycle_residual is None or abs(float(cycle_residual)) > 1e-6:
+        raise ValueError(
+            f'Sizing case {case!r} failed its cyclic-closure audit: {cycle_residual}'
+        )
+
+    params = json.loads(params_path.read_text(encoding='utf-8'))
+    out = apply_sizing_case(params, case=case, results_root=results_root)
+    out['sizing_case_applied'].update(
+        operation_year=1,
+        source_sha256=hashlib.sha256(sizing_path.read_bytes()).hexdigest(),
+        parameters_source=params_path.as_posix(),
+        parameters_sha256=hashlib.sha256(params_path.read_bytes()).hexdigest(),
+    )
     return out
 
 
@@ -221,54 +290,155 @@ def predecessor_pairs(times: List[datetime]) -> List[Tuple[datetime, datetime]]:
     return list(zip(times[:-1], times[1:]))
 
 
+def outage_hazard_rate_per_hour(
+    outage_probability_pct: float,
+    reference_hours: float = 24.0,
+) -> float:
+    """Convert a reference-window outage probability into an hourly hazard."""
+    p_ref = float(outage_probability_pct) / 100.0
+    if not 0.0 <= p_ref < 1.0:
+        raise ValueError("outage_probability_pct must be in [0, 100)")
+    if reference_hours <= 0.0:
+        raise ValueError("outage_probability_reference_hours must be > 0")
+    if p_ref == 0.0:
+        return 0.0
+    return -math.log1p(-p_ref) / float(reference_hours)
+
+
+def build_fixed_contingency_data(
+    times: List[datetime],
+    dt_h_map: Dict[datetime, float],
+    horizon_hours: float,
+    outage_duration_hours: float,
+    outage_probability_pct: float,
+    outage_probability_reference_hours: float = 24.0,
+    contingency_spacing_hours: float = 2.0,
+) -> Dict[str, Any]:
+    """Build mesh-independent outage scenarios and first-arrival weights.
+
+    Candidate starts lie on a fixed physical support. Every start and outage
+    end must align with the model grid, which prevents coarse intervals from
+    silently lengthening an outage. Only complete outages are represented.
+    """
+    if not times:
+        raise ValueError("times must not be empty")
+    if any(t not in dt_h_map for t in times):
+        raise ValueError("dt_h_map must contain every timestamp in times")
+    if any(float(dt_h_map[t]) <= 0.0 for t in times):
+        raise ValueError("all model intervals must have positive duration")
+
+    horizon_h = float(horizon_hours)
+    outage_h = float(outage_duration_hours)
+    spacing_h = float(contingency_spacing_hours)
+    if horizon_h <= 0.0:
+        raise ValueError("horizon_hours must be > 0")
+    if outage_h < 0.0 or outage_h > horizon_h:
+        raise ValueError("outage_duration_hours must be in [0, horizon_hours]")
+    if spacing_h <= 0.0:
+        raise ValueError("contingency_spacing_hours must be > 0")
+
+    modeled_h = sum(float(dt_h_map[t]) for t in times)
+    if not math.isclose(modeled_h, horizon_h, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            f"time grid spans {modeled_h:g} h, but horizon_hours={horizon_h:g}"
+        )
+
+    hazard = outage_hazard_rate_per_hour(
+        outage_probability_pct,
+        reference_hours=float(outage_probability_reference_hours),
+    )
+    eligible_h = max(0.0, horizon_h - outage_h)
+    base = {
+        "contingencies": ["c0"],
+        "starts": [],
+        "windows": {"c0": []},
+        "before": {"c0": []},
+        "pi_c": {"c0": 1.0},
+        "hazard_rate_per_hour": hazard,
+        "eligible_start_hours": eligible_h,
+        "bins": {},
+    }
+    if hazard == 0.0 or outage_h == 0.0 or eligible_h <= 0.0:
+        return base
+
+    start_dt = times[0]
+    time_index = {t: i for i, t in enumerate(times)}
+    starts: List[datetime] = []
+    windows: Dict[Any, List[datetime]] = {"c0": []}
+    before: Dict[Any, List[datetime]] = {"c0": []}
+    pi_c: Dict[Any, float] = {}
+    bins: Dict[Any, Dict[str, float]] = {}
+
+    offset_h = 0.0
+    while offset_h < eligible_h - 1e-9:
+        start = start_dt + timedelta(hours=offset_h)
+        if start not in time_index:
+            raise ValueError(
+                "Fixed contingency support is not aligned with the time grid: "
+                f"start offset {offset_h:g} h is missing. Choose mesh steps that "
+                "divide EDS.contingency_spacing_hours."
+            )
+
+        end = start + timedelta(hours=outage_h)
+        window = [t for t in times if start <= t < end]
+        represented_h = sum(float(dt_h_map[t]) for t in window)
+        if not math.isclose(represented_h, outage_h, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                "Outage window is not represented exactly by the time grid: "
+                f"start={start}, expected={outage_h:g} h, represented={represented_h:g} h. "
+                "Choose mesh steps and contingency spacing that align outage starts and ends."
+            )
+
+        bin_end_h = min(offset_h + spacing_h, eligible_h)
+        starts.append(start)
+        windows[start] = window
+        before[start] = times[: time_index[start]]
+        pi_c[start] = math.exp(-hazard * offset_h) - math.exp(-hazard * bin_end_h)
+        bins[start] = {"start_offset_h": offset_h, "end_offset_h": bin_end_h}
+        offset_h += spacing_h
+
+    pi_c["c0"] = math.exp(-hazard * eligible_h)
+    total = sum(pi_c.values())
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        pi_c["c0"] += 1.0 - total
+
+    return {
+        "contingencies": ["c0", *starts],
+        "starts": starts,
+        "windows": windows,
+        "before": before,
+        "pi_c": pi_c,
+        "hazard_rate_per_hour": hazard,
+        "eligible_start_hours": eligible_h,
+        "bins": bins,
+    }
+
+
 def build_contingency_times(start_dt: datetime,
                             horizon_hours: int,
                             outage_duration_hours: int,
                             dt1_min: int,
-                            dt2_min: int) -> List[datetime]:
-    """
-    Generates the start times 'c' for contingency (outage) scenarios with the rule:
-      - include half of the fine steps (dt1) at the beginning,
-      - skip the other half of the fine steps,
-      - include all coarse steps (dt2) except the last one.
-
-    Notes:
-      - If outage_duration_hours = 0, there will be no fine part; all coarse steps except the last are included.
-      - Returns a sorted list with no duplicates.
-    """
-    if horizon_hours <= 0:
-        raise ValueError("horizon_hours must be > 0")
-    if not (0 <= outage_duration_hours <= horizon_hours):
-        raise ValueError("outage_duration_hours must be in [0, horizon_hours]")
-    if dt1_min <= 0 or dt2_min <= 0:
-        raise ValueError("timestep_1_min and timestep_2_min must be > 0 (min)")
-
-    # number of fine and coarse steps (same divisibility checks as in build_dt_vector)
-    steps_fine = (outage_duration_hours * 60) // dt1_min
-    if steps_fine * dt1_min != outage_duration_hours * 60:
-        raise ValueError("outage_duration_hours * 60 must be an exact multiple of timestep_1_min")
-
-    steps_coarse = ((horizon_hours - outage_duration_hours) * 60) // dt2_min
-    if steps_coarse * dt2_min != (horizon_hours - outage_duration_hours) * 60:
-        raise ValueError("(horizon_hours - outage_duration_hours) * 60 must be an exact multiple of timestep_2_min")
-
-    # complete time grid (same logic as build_time_grid)
-    dt_min = [dt1_min] * steps_fine + [dt2_min] * steps_coarse
-    times: List[datetime] = [start_dt]
-    for dm in dt_min[:-1]:
-        times.append(times[-1] + timedelta(minutes=dm))
-
-    # indices that are included in the contingency set
-    # half of the fine steps (floor)
-    half_fine = steps_fine // 2
-    idx_fine_in = list(range(1, half_fine))  # includes the 1st half, starting from index 1
-    # coarse steps: all except the last one
-    idx_coarse_in = list(range(steps_fine, steps_fine + max(steps_coarse - 1, 0)))
-
-    # final result (sorted and unique)
-    cont_idx = sorted(set(idx_fine_in + idx_coarse_in))
-    contingencies = [times[i] for i in cont_idx]
-    return contingencies
+                            dt2_min: int,
+                            contingency_spacing_hours: Optional[float] = None) -> List[datetime]:
+    """Compatibility wrapper returning the corrected fixed physical support."""
+    dt_min = build_dt_vector(
+        horizon_hours, outage_duration_hours, dt1_min, dt2_min
+    )
+    times = build_time_grid(start_dt, dt_min)
+    dt_h_map = {t: float(dm) / 60.0 for t, dm in zip(times, dt_min)}
+    data = build_fixed_contingency_data(
+        times=times,
+        dt_h_map=dt_h_map,
+        horizon_hours=horizon_hours,
+        outage_duration_hours=outage_duration_hours,
+        outage_probability_pct=1.0,
+        contingency_spacing_hours=float(
+            contingency_spacing_hours
+            if contingency_spacing_hours is not None
+            else (outage_duration_hours or 2.0)
+        ),
+    )
+    return list(data["starts"])
 
 
 def build_time_and_contingencies_from_params(params: Dict[str, Any],
@@ -280,7 +450,16 @@ def build_time_and_contingencies_from_params(params: Dict[str, Any],
 
     dt_min = build_dt_vector(horizon_hours, outage_duration_hours, dt1_min, dt2_min)
     times = build_time_grid(start_dt, dt_min)
-    contingencies = build_contingency_times(start_dt, horizon_hours, outage_duration_hours, dt1_min, dt2_min)
+    contingencies = build_contingency_times(
+        start_dt,
+        horizon_hours,
+        outage_duration_hours,
+        dt1_min,
+        dt2_min,
+        contingency_spacing_hours=float(
+            params.get("contingency_spacing_hours", outage_duration_hours or 2.0)
+        ),
+    )
     return times, contingencies
 
 

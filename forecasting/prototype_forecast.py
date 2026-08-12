@@ -154,31 +154,6 @@ class PerfectForecast:
         }
 
 
-class HybridForecast:
-    """One forecaster on the fine (dt1) steps, another on the coarse ones."""
-
-    def __init__(self, fine, coarse) -> None:
-        self.fine = fine
-        self.coarse = coarse
-
-    def get_forecasts(self, start_dt0, intervals=None, dt_min=None, include_actuals=False):
-        out_fine = self.fine.get_forecasts(start_dt0, intervals, dt_min, include_actuals)
-        out_coarse = self.coarse.get_forecasts(start_dt0, intervals, dt_min, include_actuals)
-        if out_fine is None or out_coarse is None:
-            return None
-        if not _is_iterable_ints(dt_min):
-            return out_fine
-        dt_seq = [int(v) for v in dt_min]
-        dt_fine = dt_seq[0]
-        out: Dict[str, Dict[pd.Timestamp, float]] = {"load_kw": {}, "pv_kw": {}}
-        for key in out:
-            for (ts, v_fine), v_coarse, dt in zip(
-                out_fine[key].items(), out_coarse[key].values(), dt_seq
-            ):
-                out[key][ts] = v_fine if dt == dt_fine else v_coarse
-        return out
-
-
 class PrototypeForecast:
     """Analog-day forecaster with the same get_forecasts() interface as ForecastMPC."""
 

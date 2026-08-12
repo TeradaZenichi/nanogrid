@@ -461,22 +461,23 @@ class GridEnv:
         ref_line = served + Pch
         residual = ref_line - supply
 
-        # Post-balance corrections
+        # Post-balance corrections. Load shedding is continuous because the
+        # operational models are solved with X_L in [0, 1]. Keeping a 10%
+        # discretization only in the plant used to over-shed load and leave an
+        # unphysical generation surplus after the correction.
         if self.mode == "offgrid":
-            # Deficit after max discharge -> increase shedding in 10% steps
+            # Deficit after maximum feasible discharge -> shed exactly the
+            # remaining deficit.
             if residual > self.tol_kw:
-                needed_kw = residual
-                shed_step_kw = 0.10 * load0
-                if shed_step_kw > 1e-6:
-                    num_steps_needed = math.ceil(needed_kw / shed_step_kw)
-                    new_total_XL = min(1.0, num_steps_needed * 0.10)
-                    if new_total_XL > XL:
-                        dXL = new_total_XL - XL
-                        XL = new_total_XL
-                        served = load0 * (1.0 - XL)
-                        shed   = load0 - served
-                        clamps["offgrid_autofix_shed"] = {"dXL": dXL, "new_XL_pct": XL * 100}
-                # Recompute balance
+                additional_shed = min(float(residual), max(float(served), 0.0))
+                if additional_shed > 0.0:
+                    served -= additional_shed
+                    shed += additional_shed
+                    XL = min(1.0, max(0.0, _safe_div(shed, load0)))
+                    clamps["offgrid_autofix_shed"] = {
+                        "additional_kw": float(additional_shed),
+                        "new_XL_pct": float(XL * 100.0),
+                    }
                 supply   = usedpv + Pdis + Pgrid_in - Pgrid_out
                 ref_line = served + Pch
                 residual = ref_line - supply
@@ -529,17 +530,15 @@ class GridEnv:
                     ref_line = served + Pch
                     residual = ref_line - supply
             if residual > self.tol_kw:
-                needed_kw = residual
-                shed_step_kw = 0.10 * load0
-                if shed_step_kw > 1e-6:
-                    num_steps_needed = math.ceil(needed_kw / shed_step_kw)
-                    new_total_XL = min(1.0, num_steps_needed * 0.10)
-                    if new_total_XL > XL:
-                        dXL = new_total_XL - XL
-                        XL = new_total_XL
-                        served = load0 * (1.0 - XL)
-                        shed   = load0 - served
-                        clamps["ongrid_autofix_shed"] = {"dXL": dXL, "new_XL_pct": XL * 100}
+                additional_shed = min(float(residual), max(float(served), 0.0))
+                if additional_shed > 0.0:
+                    served -= additional_shed
+                    shed += additional_shed
+                    XL = min(1.0, max(0.0, _safe_div(shed, load0)))
+                    clamps["ongrid_autofix_shed"] = {
+                        "additional_kw": float(additional_shed),
+                        "new_XL_pct": float(XL * 100.0),
+                    }
                 supply   = usedpv + Pdis + Pgrid_in - Pgrid_out
                 ref_line = served + Pch
                 residual = ref_line - supply
@@ -564,6 +563,22 @@ class GridEnv:
 
         if abs(residual) <= self.tol_kw:
             residual = 0.0
+        else:
+            raise RuntimeError(
+                "Physical power balance could not be restored at "
+                f"{self.timestamp} in {self.mode} mode: residual={residual:.12g} kW, "
+                f"load={load0:.12g} kW, pv={pv0:.12g} kW, "
+                f"bess={Pb_eff:.12g} kW."
+            )
+
+        if self.mode == "offgrid" and (
+            abs(Pgrid_in) > self.tol_kw or abs(Pgrid_out) > self.tol_kw
+        ):
+            raise RuntimeError(
+                "Grid exchange remained active during an outage at "
+                f"{self.timestamp}: import={Pgrid_in:.12g} kW, "
+                f"export={Pgrid_out:.12g} kW."
+            )
 
         # SOC update
         E_next = self.E_meas + self.dt_h * (self.bess["eta_c"] * Pch - (1.0 / self.bess["eta_d"]) * Pdis)

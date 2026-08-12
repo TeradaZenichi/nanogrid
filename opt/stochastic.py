@@ -30,7 +30,13 @@ from pyomo.environ import (
     value,
 )
 
-from .utils import build_dt_vector, build_time_grid, predecessor_pairs, solve_model
+from .utils import (
+    build_dt_vector,
+    build_fixed_contingency_data,
+    build_time_grid,
+    predecessor_pairs,
+    solve_model,
+)
 
 
 # Scenario inputs (same prototypes/probabilities used by the sizing model)
@@ -103,6 +109,14 @@ class Parameters:
         out["eta_c"] = float(bess["eta_c"])
         out["eta_d"] = float(bess["eta_d"])
         out["R_bess_kw_per_step"] = float(bess.get("ramp_kw_per_step", 1.0))
+        out["ramp_reference_min"] = float(
+            bess.get("ramp_reference_min", time.get("timestep", 5.0))
+        )
+        out["terminal_energy_policy"] = str(
+            bess.get("terminal_energy_policy", "initial")
+        ).lower()
+        if out["terminal_energy_policy"] not in {"initial", "none"}:
+            raise ValueError("BESS.terminal_energy_policy must be 'initial' or 'none'")
 
         out["P_PV_nom_kw"] = float(pv["Pmax_kw"])
         out["P_L_nom_kw"] = float(load["Pmax_kw"])
@@ -111,10 +125,14 @@ class Parameters:
         out["P_grid_export_cap_kw"] = float(abs(eds.get("Pmin", 0.0)))
         out["outage_probability_pct"] = float(eds.get("outage_probability_pct", 0.0))
         out["outage_duration_hours"] = float(eds.get("outage_duration_hours", 0.0))
+        out["outage_probability_reference_hours"] = float(
+            eds.get("outage_probability_reference_hours", 24.0)
+        )
+        out["contingency_spacing_hours"] = float(
+            eds.get("contingency_spacing_hours", out["outage_duration_hours"] or 2.0)
+        )
 
         out["split"] = str(sizing.get("split", "train"))
-        out["contingency_step_slots"] = int(sizing.get("contingency_step_slots", 4))
-        out["max_contingency_starts"] = sizing.get("max_contingency_starts")
         out["include_zero_prob_scenarios"] = bool(sizing.get("include_zero_prob_scenarios", True))
         return out
 
@@ -128,71 +146,49 @@ class Parameters:
         )
         times = build_time_grid(start_dt, dt_min)
         trans_pairs = predecessor_pairs(times)
-        dt_h_map: Dict[datetime, float] = {}
-        for t0, t1 in trans_pairs:
-            dt_h_map[t0] = (t1 - t0).total_seconds() / 3600.0
-        dt_h_map[times[-1]] = dt_h_map[trans_pairs[-1][0]]
+        dt_h_map = {t: float(dm) / 60.0 for t, dm in zip(times, dt_min)}
 
         tou_map = p["tou_map"]
         price_map = {t: float(tou_map.get(f"{t.hour:02d}:00", 0.0)) for t in times}
 
-        contingencies, windows, before, pi_c = self.build_contingencies(times)
+        contingency_data = build_fixed_contingency_data(
+            times=times,
+            dt_h_map=dt_h_map,
+            horizon_hours=float(p["horizon_hours"]),
+            outage_duration_hours=float(p["outage_duration_hours"]),
+            outage_probability_pct=float(p["outage_probability_pct"]),
+            outage_probability_reference_hours=float(
+                p["outage_probability_reference_hours"]
+            ),
+            contingency_spacing_hours=float(p["contingency_spacing_hours"]),
+        )
+        labels = ["c0"] + [f"c_{i:03d}" for i in range(len(contingency_data["starts"]))]
+        start_by_label = {
+            label: start for label, start in zip(labels[1:], contingency_data["starts"])
+        }
+        windows = {"c0": []}
+        before = {"c0": []}
+        pi_c = {"c0": float(contingency_data["pi_c"]["c0"])}
+        for label, start in start_by_label.items():
+            windows[label] = contingency_data["windows"][start]
+            before[label] = contingency_data["before"][start]
+            pi_c[label] = float(contingency_data["pi_c"][start])
         return {
             "times": times,
             "trans_pairs": trans_pairs,
             "dt_h_map": dt_h_map,
             "price_map": price_map,
-            "dt_ref_h": max(1e-9, p["timestep_1_min"] / 60.0),
-            "contingencies": contingencies,
+            "dt_ref_h": max(1e-9, p["ramp_reference_min"] / 60.0),
+            "contingencies": labels,
+            "contingency_starts": {
+                label: start.isoformat() for label, start in start_by_label.items()
+            },
             "windows": windows,
             "before": before,
             "pi_c": pi_c,
+            "hazard_rate_per_hour": contingency_data["hazard_rate_per_hour"],
+            "eligible_start_hours": contingency_data["eligible_start_hours"],
         }
-
-    def build_contingencies(
-        self, times: List[datetime]
-    ) -> Tuple[List[str], Dict[str, List[datetime]], Dict[str, List[datetime]], Dict[str, float]]:
-        contingencies = ["c0"]
-        windows: Dict[str, List[datetime]] = {"c0": []}
-        before: Dict[str, List[datetime]] = {"c0": []}
-
-        out_prob = max(0.0, min(1.0, float(self.data["outage_probability_pct"]) / 100.0))
-        out_h = max(0.0, float(self.data["outage_duration_hours"]))
-        step = max(1, int(self.data.get("contingency_step_slots", 4)))
-        max_starts = self.data.get("max_contingency_starts")
-
-        if out_prob > 0.0 and out_h > 0.0 and times:
-            starts_idx = list(range(0, len(times), step))
-            if max_starts is not None:
-                starts_idx = starts_idx[: int(max_starts)]
-
-            for i in starts_idx:
-                t0 = times[i]
-                c = f"c_{i}"
-                tend = t0 + timedelta(hours=out_h)
-                contingencies.append(c)
-                windows[c] = [t for t in times if (t >= t0 and t < tend)]
-                before[c] = times[:i]
-
-        n_out = len(contingencies) - 1
-        if n_out <= 0 or out_prob <= 0.0:
-            pi_c = {"c0": 1.0}
-        else:
-            p_each = out_prob / float(n_out)
-            pi_c = {"c0": max(0.0, 1.0 - out_prob)}
-            for c in contingencies:
-                if c != "c0":
-                    pi_c[c] = p_each
-
-        # Guard against tiny numerical drift.
-        s = sum(pi_c.values())
-        if s <= 0.0:
-            pi_c = {"c0": 1.0}
-        else:
-            for c in list(pi_c.keys()):
-                pi_c[c] = float(pi_c[c]) / float(s)
-
-        return contingencies, windows, before, pi_c
 
 
 class ScenarioLibrary:
@@ -418,7 +414,6 @@ class OnGridStochasticOperation:
         m.P_dis = Var(m.T, domain=NonNegativeReals)
         m.P_bess = Var(m.T, domain=Reals)
         m.E = Var(m.T, domain=NonNegativeReals)
-        m.Pbess_abs = Var(m.T, domain=NonNegativeReals)
 
         m.P_gin = Var(m.T, m.S, m.C, domain=NonNegativeReals)
         m.P_gout = Var(m.T, m.S, m.C, domain=NonNegativeReals)
@@ -436,8 +431,6 @@ class OnGridStochasticOperation:
         m.R_bess = Param(initialize=float(self.param.data["R_bess_kw_per_step"]))
 
         # BESS constraints
-        m.AbsPos = Constraint(m.T, rule=lambda _m, t: _m.Pbess_abs[t] >= _m.P_bess[t])
-        m.AbsNeg = Constraint(m.T, rule=lambda _m, t: _m.Pbess_abs[t] >= -_m.P_bess[t])
         m.PbessLink = Constraint(m.T, rule=lambda _m, t: _m.P_bess[t] == _m.P_dis[t] - _m.P_ch[t])
         m.Dynamics = Constraint(
             m.TRANS,
@@ -489,6 +482,15 @@ class OnGridStochasticOperation:
         )
         m.E_hat = Param(initialize=float(E_hat_kwh))
         m.InitialCond = Constraint(rule=lambda _m: _m.E[first_t] == _m.E_hat)
+        if self.param.data["terminal_energy_policy"] == "initial":
+            last_t = self._times[-1]
+            # Include the last action because E[last_t] is pre-interval energy.
+            m.TerminalEnergy = Constraint(
+                expr=m.E[last_t]
+                + m.dt_h[last_t]
+                * (m.eta_c * m.P_ch[last_t] - m.P_dis[last_t] / m.eta_d)
+                >= m.E_hat
+            )
 
         # Grid and outage constraints
         m.GridImportCap = Constraint(
@@ -581,7 +583,7 @@ class OnGridStochasticOperation:
                     _m.c_shed * _m.Load_kw[t, s] * _m.X_L[t, s, c]
                     + _m.c_pv_curt * _m.PV_kw[t, s] * _m.X_PV[t, s, c]
                     + _m.c_grid[t] * _m.P_gin[t, s, c]
-                    + _m.c_deg * _m.Pbess_abs[t]
+                    + _m.c_deg * (_m.P_ch[t] + _m.P_dis[t])
                 )
                 + eps * (_m.X_L[t, s, c] + _m.X_PV[t, s, c])
                 for t in _m.T
@@ -602,6 +604,9 @@ class OnGridStochasticOperation:
             "cluster_pv_of_s": sdata["cluster_pv_of_s"],
             "prototype_slot_count": sdata["prototype_slot_count"],
             "contingencies": list(self._contingencies),
+            "contingency_starts": dict(tdata["contingency_starts"]),
+            "outage_hazard_rate_per_hour": float(tdata["hazard_rate_per_hour"]),
+            "eligible_outage_start_hours": float(tdata["eligible_start_hours"]),
         }
         return m
 

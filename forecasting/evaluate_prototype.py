@@ -5,8 +5,9 @@
 Each method produces a 36h forecast on a 5-min grid at every origin; errors
 are bucketed by lead time (5-min and 60-min block resolutions) with skill
 vs the seasonal-naive baseline. Resumable: per-origin partial sums go to
-prototype_eval_checkpoint.csv and finished origins are skipped on restart
-(delete the file for a fresh run). Outputs land in Results/forecasting/.
+prototype_eval_checkpoint.csv and finished origins are skipped on restart.
+The checkpoint is guarded by an explicit evaluation manifest. Outputs land
+in Results/forecasting-causal-v2/.
 
 Entry point: run_evaluation() — see experiments/02_forecast_eval.py.
 """
@@ -29,7 +30,8 @@ from forecasting.prototype_forecast import (  # noqa: E402
     PrototypeForecast,
     _load_prototypes,
 )
-from opt.utils import load_series_scaled  # noqa: E402
+from forecasting.causal import FORECAST_ASSEMBLY_VERSION  # noqa: E402
+from opt.utils import load_series_scaled, load_sized_parameters  # noqa: E402
 
 try:
     import matplotlib
@@ -42,13 +44,38 @@ except ImportError:  # pragma: no cover
 LOAD_CSV = "data/load_5min_test.csv"
 PV_CSV = "data/pv_5min_test.csv"
 PARAMS_JSON = "data/parameters.json"
-OUT_DIR = Path("Results/forecasting")
+OUT_DIR = Path("Results/forecasting-causal-v2")
+FORECAST_EVALUATION_VERSION = "causal-forecast-evaluation-v2"
 
 LEAD_BUCKETS_H = [(0, 1), (1, 6), (6, 12), (12, 24), (24, 36)]
 HORIZON_MIN = 36 * 60
 STEP_MIN = 5
 N_STEPS = HORIZON_MIN // STEP_MIN
 CHECKPOINT_EVERY = 100  # flush partial results to disk every N origins
+
+
+def _evaluation_manifest(
+    params: dict,
+    *,
+    days: int,
+    every_min: int,
+    start: str | None,
+    with_lstm: bool,
+) -> dict:
+    """Identity of every setting that makes a checkpoint reusable."""
+    return {
+        "forecast_evaluation_version": FORECAST_EVALUATION_VERSION,
+        "forecast_assembly_version": FORECAST_ASSEMBLY_VERSION,
+        "sizing_source_sha256": params["sizing_case_applied"]["source_sha256"],
+        "days": int(days),
+        "every_min": int(every_min),
+        "start": str(pd.Timestamp(start)) if start is not None else None,
+        "with_lstm": bool(with_lstm),
+        "horizon_min": HORIZON_MIN,
+        "step_min": STEP_MIN,
+        "load_csv": LOAD_CSV,
+        "pv_csv": PV_CSV,
+    }
 
 
 def _forecast_to_array(fc_dict: dict) -> np.ndarray:
@@ -177,6 +204,7 @@ def run_evaluation(
     start: str | None = None,
     with_lstm: bool = False,
     out_dir=OUT_DIR,
+    params: dict | None = None,
 ) -> None:
     """Evaluate prototype/naive (and optionally LSTM) forecasts over the test series.
 
@@ -188,7 +216,40 @@ def run_evaluation(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    params = json.load(open(PARAMS_JSON, encoding="utf-8"))
+    params = params if params is not None else load_sized_parameters(PARAMS_JSON)
+    used_path = out_dir / 'parameters_used.json'
+    ckpt_path = out_dir / 'prototype_eval_checkpoint.csv'
+    manifest_path = out_dir / 'evaluation_manifest.json'
+    run_manifest = _evaluation_manifest(
+        params,
+        days=days,
+        every_min=every_min,
+        start=start,
+        with_lstm=with_lstm,
+    )
+    if ckpt_path.exists() and not manifest_path.exists():
+        raise RuntimeError(
+            'Forecast checkpoint has no evaluation manifest; use a fresh output directory.'
+        )
+    if manifest_path.exists() and ckpt_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous != run_manifest:
+            changed = sorted(
+                key for key in set(previous) | set(run_manifest)
+                if previous.get(key) != run_manifest.get(key)
+            )
+            raise RuntimeError(
+                'Forecast checkpoint belongs to an incompatible evaluation '
+                f'(changed: {", ".join(changed)}); use a fresh output directory.'
+            )
+    manifest_path.write_text(
+        json.dumps(run_manifest, indent=2, ensure_ascii=False), encoding='utf-8'
+    )
+    used_payload = dict(params)
+    used_payload['_forecast_evaluation'] = run_manifest
+    used_path.write_text(
+        json.dumps(used_payload, indent=2, ensure_ascii=False), encoding='utf-8'
+    )
     load_scale = float(params["Load"]["Pmax_kw"])
     pv_scale = float(params["PV"]["Pmax_kw"])
     scaling = {"P_L_nom_kw": load_scale, "P_PV_nom_kw": pv_scale}
@@ -213,7 +274,6 @@ def run_evaluation(
 
     # Resumable checkpoint: per-origin bucket partial sums appended to disk so
     # an interrupted run (crash, instance stop) resumes instead of restarting.
-    ckpt_path = out_dir / "prototype_eval_checkpoint.csv"
     done_origins: set[str] = set()
     if ckpt_path.exists():
         done_origins = set(pd.read_csv(ckpt_path, usecols=["origin"])["origin"].astype(str))
@@ -288,6 +348,8 @@ def run_evaluation(
     acc.to_csv(acc_csv, index=False)
 
     summary = {
+        "forecast_evaluation_version": FORECAST_EVALUATION_VERSION,
+        "forecast_assembly_version": FORECAST_ASSEMBLY_VERSION,
         "origins": int(len(origins)),
         "window": [str(t_first), str(t_last)],
         "methods": sorted(metrics["method"].unique().tolist()),

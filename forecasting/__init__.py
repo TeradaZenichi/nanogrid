@@ -3,6 +3,6 @@
 # forecasting.get_forecasting to keep this package import light.
 from .load_forecast import load
 from .pv_forecast import pv
-from .prototype_forecast import HybridForecast, PerfectForecast, PrototypeForecast
+from .prototype_forecast import PerfectForecast, PrototypeForecast
 
-__all__ = ["load", "pv", "PrototypeForecast", "PerfectForecast", "HybridForecast"]
+__all__ = ["load", "pv", "PrototypeForecast", "PerfectForecast"]

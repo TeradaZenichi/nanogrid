@@ -1,13 +1,13 @@
-# nanogrid
+# Residential PV--BESS planning and operation
 
-Planning and operation of a residential **PV + battery (BESS) nanogrid** that
+Planning and operation of a residential **PV + battery (BESS) system** that
 must ride through grid outages. The project couples three layers:
 
-1. an **environment** that simulates the physical nanogrid step by step (the
+1. an **environment** that simulates the physical system step by step (the
    "plant"),
 2. a **sizing** model that chooses PV and BESS capacities under uncertainty and
    multi-year degradation, and
-3. a **rolling-horizon MPC** that operates the nanogrid online, fed by different
+3. a **rolling-horizon MPC** that operates the residential system online, fed by different
    **forecasters** (perfect, LSTM, analog-day prototypes, hybrid) and compared
    against an offline stochastic plan.
 
@@ -116,6 +116,11 @@ and BESS degradation over scenarios $s$ and contingencies $c$.
   [`equacoes_degradacao_bess.tex`](equacoes_degradacao_bess.tex).
 - **Contingencies with non-anticipativity**: before an outage reveals itself,
   the contingent decisions must equal the base case `c0`.
+- **Cyclic representative days**: the final-period BESS action is propagated
+  back to a common optimized initial energy. This prevents free daily SoC
+  resets while allowing the schedule to reserve energy for late outages.
+- **Positive-probability scenarios only**: zero-probability load--PV pairs are
+  removed before model construction, avoiding degenerate operating variables.
 - **BESS Extn-LP (Pozo et al., Formulation 5)**: charge/discharge exclusivity is
   enforced *without binaries*, via an affine coupling plus energy caps — the
   model stays a pure LP. Full model: [`sizing/README.tex`](sizing/README.tex).
@@ -127,7 +132,9 @@ python experiments/01_sizing.py
 ```
 
 Runs two cases (with / without degradation) and writes decision variables,
-yearly capacity, OPEX breakdown and operation CSVs to `Results/sizing/<case>/`.
+yearly capacity, OPEX breakdown, operation CSVs and Gulliver-font PDF figures
+to `Results/sizing/<case>/`. The consolidated report is written to
+`Results/sizing/sizing_report.pdf`.
 The fast LP method (barrier/IPM without crossover) is selected automatically for
 this large model.
 
@@ -135,7 +142,7 @@ this large model.
 
 ## 3. Operation: MPC and forecasts — [`opt/`](opt/), [`forecasting/`](forecasting/)
 
-The nanogrid is operated online by a **rolling-horizon MPC**
+The residential system is operated online by a **rolling-horizon MPC**
 ([`opt/ongrid.py`](opt/ongrid.py)): at every on-grid step it builds a short
 optimization over the prediction horizon, solves it, applies only the **first**
 action to the environment, then slides forward and re-solves with the freshly
@@ -158,12 +165,15 @@ $$P^{\mathrm{PV}}_t(1-X^{\mathrm{PV}}_{t,c}) + P^{\mathrm{dis}}_{t,c} - P^{\math
 
 Objective (expected operating cost over the horizon):
 
-$$\min \sum_{t}\sum_{c} \pi_c\,\Delta t_t \left( c^{\mathrm{shed}} P^{\mathrm{L}}_t X^{\mathrm{L}}_{t,c} + c^{\mathrm{curt}} P^{\mathrm{PV}}_t X^{\mathrm{PV}}_{t,c} + c^{\mathrm{grid}}_t P^{\mathrm{in}}_{t,c} + c^{\mathrm{deg}} |P^{\mathrm{bess}}_{t,c}| \right)$$
+$$\min \sum_{t}\sum_{c} \pi_c\,\Delta t_t \left( c^{\mathrm{shed}} P^{\mathrm{L}}_t X^{\mathrm{L}}_{t,c} + c^{\mathrm{curt}} P^{\mathrm{PV}}_t X^{\mathrm{PV}}_{t,c} + c^{\mathrm{grid}}_t P^{\mathrm{in}}_{t,c} + c^{\mathrm{deg}} \left(P^{\mathrm{ch}}_{t,c}+P^{\mathrm{dis}}_{t,c}\right) \right)$$
 
 The BESS uses the same **Pozo Extn-LP** relaxation as sizing, so with
-`relaxation=True` the MPC is a **pure LP** (no binaries). The relaxation is exact
-here — simultaneous charge/discharge never appears at the optimum — and the
-simulators audit this (`max_simultaneous_ch_dis_kw` in `metrics.json`).
+`relaxation=True` the MPC is a **pure LP** (no binaries). The degradation term
+prices bidirectional throughput rather than absolute net power, preventing an
+objective-neutral charge/discharge loop. Every solved interval and contingency
+branch is audited; the maximum overlap is stored as
+`max_simultaneous_ch_dis_kw` in `metrics.json`, and the corrected pipeline
+rejects cases above $10^{-6}$ kW.
 
 ### How forecasts enter
 
@@ -183,7 +193,6 @@ Interchangeable implementations:
 | `PerfectForecast` | `forecasting/prototype_forecast.py` | oracle — returns the actual future (upper bound) |
 | `ForecastMPC` | `forecasting/get_forecasting.py` | LSTM (VSTF + day-ahead); loads TensorFlow |
 | `PrototypeForecast` | `forecasting/prototype_forecast.py` | **analog day**: pick the current day's cluster prototype (`calendar` / `prefix` / `knn`) and use it as the long-horizon forecast |
-| `HybridForecast` | `forecasting/prototype_forecast.py` | LSTM on the fine steps, prototype on the coarse steps |
 
 The analog-day forecaster reuses the *same* DTW cluster prototypes as the sizing
 scenarios, which makes the prototype-MPC the *certainty-equivalent* of the
@@ -197,38 +206,73 @@ save artifacts (`parameters_used.json`, `outage_calendar.json`,
 `operation_final.csv`, `metrics.json`):
 
 ```python
-from opt import simulate_mpc, simulate_stochastic
+from opt import load_sized_parameters, simulate_mpc, simulate_stochastic
 from forecasting import PerfectForecast
 
+params = load_sized_parameters()  # requires experiments/01_sizing.py first
 simulate_mpc(params, PerfectForecast(load_s, pv_s), start, n_iters, out_dir)
 simulate_stochastic(params, start, n_iters, out_dir)  # receding plan, re-solved daily
 ```
 
 ### Experiments
 
-All experiment entry points live in [`experiments/`](experiments/), numbered in
-the natural run order. Run them from the repo root, e.g.
-`python experiments/01_sizing.py`.
+All active experiment entry points live in [`experiments/`](experiments/).
+Experiment 01 must run before forecasting or operation because those stages
+require its traceable `alpha_gt_0` sizing artifact.
 
 | Script | Purpose |
 |---|---|
 | [`01_sizing.py`](experiments/01_sizing.py) | PV/BESS sizing with and without degradation |
+| [`01_1_sizing.py`](experiments/01_1_sizing.py) | one-at-a-time sizing sensitivity analysis |
 | [`02_forecast_eval.py`](experiments/02_forecast_eval.py) | offline forecast quality (prototypes vs naive vs LSTM) |
-| [`03_forecaster_comparison.py`](experiments/03_forecaster_comparison.py) | operation: ideal vs stochastic vs LSTM vs prototype vs hybrid |
-| [`04_sized_system.py`](experiments/04_sized_system.py) | same comparison on the *sized* system |
-| [`05_mesh_sweep.py`](experiments/05_mesh_sweep.py) | time-mesh grid search $(h, \Delta t_1, \Delta t_2)$ |
-| [`06_robustness.py`](experiments/06_robustness.py) | actuator noise, outage probability and seeds |
-| [`07_seasonal.py`](experiments/07_seasonal.py) | monthly windows across the test year |
-| [`08_t2_refinement.py`](experiments/08_t2_refinement.py) | extra $\Delta t_2$ points on the Pareto line |
-| [`09_mesh_seasonal.py`](experiments/09_mesh_seasonal.py) | full mesh grid in three more seasons |
-| [`10_recourse.py`](experiments/10_recourse.py) | stochastic re-solve frequency sweep |
-| [`11_champion.py`](experiments/11_champion.py) | LSTM/hybrid on the best mesh |
+| [`12_corrected_pipeline.py`](experiments/12_corrected_pipeline.py) | current causal, versioned and resumable operational campaign |
 
-Each writes a `summary.csv` under `Results/<experiment>/`, saves per-case
-artifacts, and skips cases already completed (resume). Configuration is plain
-constants at the top of each script — no CLI flags. Figures and tables are
-rebuilt from the summaries by `scripts/make_figures.py` and
-`scripts/make_tables.py`.
+The operational pipeline exposes explicit CLI stages, writes resumable cases
+under `Results`, and continuously updates `summary.csv` and
+`pipeline_state.json`. Figures and tables are rebuilt from the summaries by
+`scripts/make_figures.py` and `scripts/make_tables.py`.
+
+The corrected campaign uses a fixed physical outage support, hazard-based
+scenario weights, complete pre-outage non-anticipativity, a 5-min ramp
+reference, terminal-energy closure, and causal hourly LSTM inputs assembled
+only from fully completed observation hours. Its temporal-mesh sweep evaluates
+ideal, prototype-prefix, and LSTM forecasts. The ideal forecast is retained as
+a perfect-information target but does not participate in mesh selection.
+Candidate meshes are selected from the Pareto front using prototype and LSTM
+relative regret together with solve time. The annual campaign evaluates all 81
+mesh--forecaster
+configurations for 10 days in each of the 12 months of the test year. Each
+month uses a distinct outage seed shared by all configurations, preserving
+common-random-number comparisons. The completed May sweep is reused only
+within the same model version, leaving 891 additional monthly runs. Legacy
+results remain untouched under `results-old`; the strict-balance campaign and
+the sizing and forecasting artifacts used by the paper are written to
+`Results`.
+The default command runs only a short integration test:
+
+```bash
+python experiments/12_corrected_pipeline.py
+```
+
+The first recommended run is the 72-case causal pilot: LSTM and prototype on
+three diagnostic meshes and 12 monthly 10-day windows. Both controllers are
+rerun under the same physical model, and the stage writes
+`comparison_lstm_prototype.csv`:
+
+```bash
+python experiments/12_corrected_pipeline.py --stage causal-pilot --workers 4
+```
+
+The full dependency-ordered campaign is explicit and resumable:
+
+```bash
+python experiments/12_corrected_pipeline.py --stage all --workers 4
+```
+
+Individual stages are `causal-pilot`, `mesh`, `annual-mesh` (`seasonal`
+is an alias), `forecast`, `recourse`, and `robustness`. Each stage
+continuously updates `summary.csv` and
+`pipeline_state.json`, including elapsed time and an ETA.
 
 ---
 
