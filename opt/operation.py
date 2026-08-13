@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from env.grid_env import GridEnv
+from .closed_loop import run_mpc_closed_loop
 from .ongrid import OnGridMPC
 from .stochastic import OnGridStochasticOperation
 from .utils import build_dt_vector, outage_hazard_rate_per_hour
@@ -486,91 +487,30 @@ def simulate_mpc(
     env = _make_env(params, load_csv, pv_csv, start_ts, n_iters, out_dir)
 
     mpc = OnGridMPC(params, relaxation=True)
-    pbess_prev_kw = 0.0
-    n_ongrid = n_offgrid = n_solve_ok = n_solve_fail = 0
-    solve_time_total = 0.0
-    max_simultaneity_kw = 0.0
-    run_t0 = time.perf_counter()
-
-    while not env.done():
-        loop_t0 = time.perf_counter()
-        now = env.timestamp
-
-        if env.mode == "offgrid":
-            n_offgrid += 1
-            step0 = None
-        else:
-            n_ongrid += 1
-            try:
-                forecasts = forecaster.get_forecasts(
-                    start_dt0=now, intervals=None, dt_min=env.dt_min, include_actuals=False
-                )
-                if forecasts is None:
-                    raise RuntimeError("forecast window out of data range")
-
-                solve_t0 = time.perf_counter()
-                mpc.build(
-                    start_dt=now.to_pydatetime(),
-                    forecasts=forecasts,
-                    E_hat_kwh=float(env.E_meas),
-                    P_bess_hat_kw=pbess_prev_kw,
-                )
-                mpc.solve(tee=False, **opts)
-                solve_time_total += time.perf_counter() - solve_t0
-                n_solve_ok += 1
-                max_simultaneity_kw = max(
-                    max_simultaneity_kw,
-                    mpc.max_simultaneous_charge_discharge_kw(),
-                )
-                step0 = mpc.extract_first_step(scenario="c0")
-            except Exception as e:
-                n_solve_fail += 1
-                print(f"[mpc] WARN: solve failed at {now}: {e}. Using safe fallback.")
-                step0 = None
-
-        if step0 is None:
-            P_bess, X_L, X_PV, obj = 0.0, None, None, None
-        else:
-            P_bess = float(step0.get("P_bess_kw", 0.0))
-            X_L = float(step0.get("X_L", 0.0))
-            X_PV = float(step0.get("X_PV", 0.0))
-            obj = float(step0.get("obj", 0.0))
-
-        row, done = env.step(
-            P_bess_kw=P_bess, X_L=X_L, X_PV=X_PV, obj=obj,
-            exec_time_sec=time.perf_counter() - loop_t0,
-        )
-        pbess_prev_kw = float(row.get("P_bess_kw", P_bess)) if isinstance(row, dict) else P_bess
-
-        if env.iter_k % max(1, progress_every) == 0 or done:
-            elapsed = time.perf_counter() - run_t0
-            avg = solve_time_total / n_solve_ok if n_solve_ok else 0.0
-            print(
-                f"[mpc] {forecaster_name or type(forecaster).__name__} "
-                f"{env.iter_k}/{n_iters} | elapsed={elapsed:.0f}s avg_solve={avg:.2f}s "
-                f"ok={n_solve_ok} fail={n_solve_fail} offgrid={n_offgrid}"
-            )
-        if done:
-            break
+    loop = run_mpc_closed_loop(
+        env=env, mpc=mpc, forecaster=forecaster, solver_opts=opts, n_iters=int(n_iters),
+        controller_label=forecaster_name or type(forecaster).__name__,
+        progress_every=progress_every,
+    )
 
     metrics = {
         "controller": "mpc",
         "forecaster": forecast_label,
         "forecaster_version": run_config.get("forecaster_version"),
-        "status": "ok" if n_solve_fail == 0 else "warning",
+        "status": "ok" if loop.n_solve_fail == 0 else "warning",
         "termination": "completed",
         "horizon_hours": int(params["time"]["horizon_hours"]),
         "timestep_1_min": int(params["time"]["timestep_1_min"]),
         "timestep_2_min": int(params["time"]["timestep_2_min"]),
         "n_iters": int(n_iters),
-        "n_ongrid_steps": int(n_ongrid),
-        "n_offgrid_steps": int(n_offgrid),
-        "n_solve_ok": int(n_solve_ok),
-        "n_solve_fail": int(n_solve_fail),
-        "total_solve_time_s": float(solve_time_total),
-        "avg_solve_time_s": float(solve_time_total / n_solve_ok) if n_solve_ok else None,
-        "total_time_s": float(time.perf_counter() - run_t0),
-        "max_simultaneous_ch_dis_kw": float(max_simultaneity_kw),
+        "n_ongrid_steps": int(loop.n_ongrid_steps),
+        "n_offgrid_steps": int(loop.n_offgrid_steps),
+        "n_solve_ok": int(loop.n_solve_ok),
+        "n_solve_fail": int(loop.n_solve_fail),
+        "total_solve_time_s": float(loop.total_solve_time_s),
+        "avg_solve_time_s": loop.average_solve_time_s,
+        "total_time_s": float(loop.total_time_s),
+        "max_simultaneous_ch_dis_kw": float(loop.max_simultaneous_ch_dis_kw),
         "run_start_ts": run_config["start_ts"],
         "run_fingerprint_sha256": _run_fingerprint(run_config),
     }
