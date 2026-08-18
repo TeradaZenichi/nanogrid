@@ -1,11 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-On-grid stochastic MPC.
-
-This module keeps the public API of `OnGridMPC` intact while internally
-organizing the model in component classes (`Parameters`, `Load`, `PV`,
-`Grid`, `BESS`, `Scenarios`) similar to the structure used in `sizing`.
-"""
+"""Contingency-aware on-grid model predictive controller."""
 
 from __future__ import annotations
 

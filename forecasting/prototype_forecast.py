@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-# File: forecasting/prototype_forecast.py
 """Analog-day forecasters built on the DTW cluster prototypes (48 x 30-min slots).
 
 Cluster selection strategies: "calendar" (most probable from train marginals),
@@ -29,18 +27,21 @@ DEFAULT_DATA = {
 }
 
 DEFAULT_MISC = {
-    "day_start_hour": 6.0,   # PV daylight window for prefix classification
+    "day_start_hour": 6.0,
     "day_end_hour": 19.0,
-    "min_prefix_slots": 4,   # fall back to "calendar" before 2h of observations
-    "blend_steps": 6,        # 5-min steps blended from the anchor observation
-    "default_intervals": 432,  # 36h @ 5 min
+    "min_prefix_slots": 4,
+    "blend_steps": 6,
+    "default_intervals": 432,
     "default_dt_min": 5,
 }
 
 VALID_STRATEGIES = ("calendar", "prefix", "knn")
+SeriesLike = Union[pd.Series, pd.DataFrame]
+GridStep = Optional[Union[int, Iterable[int]]]
+ForecastResult = Optional[Dict[str, Dict[pd.Timestamp, float]]]
 
 
-def _as_series(x: Union[pd.Series, pd.DataFrame]) -> pd.Series:
+def _as_series(x: SeriesLike) -> pd.Series:
     if isinstance(x, pd.Series):
         return x
     if isinstance(x, pd.DataFrame):
@@ -68,8 +69,7 @@ def _build_variable_grid(start: pd.Timestamp, dt_seq: Iterable[int]) -> pd.Datet
     return pd.DatetimeIndex([start + pd.Timedelta(minutes=int(off)) for off in offsets])
 
 
-def _aggregate_to_intervals(s_5min: pd.Series,
-                            starts: pd.DatetimeIndex,
+def _aggregate_to_intervals(s_5min: pd.Series, starts: pd.DatetimeIndex,
                             dt_seq: Iterable[int]) -> np.ndarray:
     out = []
     dt_seq = [int(x) for x in dt_seq]
@@ -124,17 +124,12 @@ def _daily_matrix_30min(csv_path: Path) -> pd.DataFrame:
 class PerfectForecast:
     """Perfect-information forecaster: actuals aggregated to the MPC grid."""
 
-    def __init__(self,
-                 load_kw_s: Union[pd.Series, pd.DataFrame],
-                 pv_kw_s: Union[pd.Series, pd.DataFrame]) -> None:
+    def __init__(self, load_kw_s: SeriesLike, pv_kw_s: SeriesLike) -> None:
         self.load_s = _as_series(load_kw_s)
         self.pv_s = _as_series(pv_kw_s)
 
-    def get_forecasts(self,
-                      start_dt0: Union[pd.Timestamp, str],
-                      intervals: Optional[int] = None,
-                      dt_min: Optional[Union[int, Iterable[int]]] = None,
-                      include_actuals: bool = False) -> Optional[Dict[str, Dict[pd.Timestamp, float]]]:
+    def get_forecasts(self, start_dt0: Union[pd.Timestamp, str], intervals: Optional[int] = None,
+                      dt_min: GridStep = None, include_actuals: bool = False) -> ForecastResult:
         start_dt0 = pd.Timestamp(start_dt0)
         if _is_iterable_ints(dt_min):
             dt_seq = [int(v) for v in dt_min]
@@ -157,12 +152,8 @@ class PerfectForecast:
 class PrototypeForecast:
     """Analog-day forecaster with the same get_forecasts() interface as ForecastMPC."""
 
-    def __init__(self,
-                 params: Optional[Dict[str, Any]],
-                 load_kw_s: Union[pd.Series, pd.DataFrame],
-                 pv_kw_s: Union[pd.Series, pd.DataFrame],
-                 pv_scaling: float,
-                 load_scaling: float,
+    def __init__(self, params: Optional[Dict[str, Any]], load_kw_s: SeriesLike,
+                 pv_kw_s: SeriesLike, pv_scaling: float, load_scaling: float,
                  strategy: str = "prefix") -> None:
         if strategy not in VALID_STRATEGIES:
             raise ValueError(f"strategy must be one of {VALID_STRATEGIES}, got '{strategy}'.")
@@ -187,16 +178,12 @@ class PrototypeForecast:
         slot_hours = np.arange(SLOTS_PER_DAY) * (SLOT_MIN / 60.0)
         self._pv_daylight_slots = (slot_hours >= h0) & (slot_hours < h1)
 
-        # Lazy: train day matrices are only loaded for the "knn" strategy.
         self._train_load: Optional[pd.DataFrame] = None
         self._train_pv: Optional[pd.DataFrame] = None
         if self.strategy == "knn":
             self._train_load = _daily_matrix_30min(Path(self.params["LOAD_TRAIN_CSV"]))
             self._train_pv = _daily_matrix_30min(Path(self.params["PV_TRAIN_CSV"]))
 
-    # ------------------------------------------------------------------
-    # Prefix extraction and classification
-    # ------------------------------------------------------------------
     def _observed_prefix_norm(self, kind: str, now: pd.Timestamp) -> np.ndarray:
         """Normalized 30-min means of the current day in [00:00, now); NaN-padded to 48."""
         s = self.load_s if kind == "load" else self.pv_s
@@ -207,7 +194,7 @@ class PrototypeForecast:
         if window.empty or scale <= 0:
             return out
         g = window.groupby((window.index.hour * 60 + window.index.minute) // SLOT_MIN).mean()
-        # Only slots fully elapsed before `now` count as observed.
+        # A slot is causal only after all of its native samples have elapsed.
         n_complete = int((now - day0).total_seconds() // (SLOT_MIN * 60))
         for slot, val in g.items():
             if int(slot) < n_complete:
@@ -240,15 +227,12 @@ class PrototypeForecast:
         d = np.linalg.norm(mat.values[:, mask] - prefix[mask], axis=1)
         return mat.values[int(np.argmin(d))].astype(float)
 
-    # ------------------------------------------------------------------
-    # Profile assembly
-    # ------------------------------------------------------------------
     def _day_profile_norm(self, kind: str, day: pd.Timestamp, now: pd.Timestamp) -> np.ndarray:
         """Normalized 48-slot profile for a given calendar day within the horizon."""
         protos = self.proto_load if kind == "load" else self.proto_pv
         calendar = self.calendar_load if kind == "load" else self.calendar_pv
         if day.normalize() != now.normalize():
-            return protos[calendar]  # future days: no prefix exists
+            return protos[calendar]
         if self.strategy == "knn":
             profile = self._knn_profile(kind, now)
             if profile is not None:
@@ -277,14 +261,8 @@ class PrototypeForecast:
             y.iloc[i] = w * actual0 + (1.0 - w) * y.iloc[i]
         return y
 
-    # ------------------------------------------------------------------
-    # Public interface (mirrors ForecastMPC.get_forecasts)
-    # ------------------------------------------------------------------
-    def get_forecasts(self,
-                      start_dt0: Union[pd.Timestamp, str],
-                      intervals: Optional[int] = None,
-                      dt_min: Optional[Union[int, Iterable[int]]] = None,
-                      include_actuals: bool = False) -> Optional[Dict[str, Dict[pd.Timestamp, float]]]:
+    def get_forecasts(self, start_dt0: Union[pd.Timestamp, str], intervals: Optional[int] = None,
+                      dt_min: GridStep = None, include_actuals: bool = False) -> ForecastResult:
         start_dt0 = pd.Timestamp(start_dt0)
         if start_dt0 not in self.load_s.index or start_dt0 not in self.pv_s.index:
             raise KeyError("start_dt0 must exist in actual series to anchor the first value.")

@@ -200,6 +200,17 @@ class Parameters:
         self.default_split = str(self.sizing_cfg.get("split", "train"))
         self.max_time_slots = self.sizing_cfg.get("max_time_slots")
         self.include_zero_prob_scenarios = bool(self.sizing_cfg.get("include_zero_prob_scenarios", False))
+        self.minimum_outage_load_served_fraction = float(
+            self.sizing_cfg.get("minimum_outage_load_served_fraction", 0.0)
+        )
+        if not 0.0 <= self.minimum_outage_load_served_fraction <= 1.0:
+            raise ValueError("minimum_outage_load_served_fraction must be in [0, 1]")
+        self.resilience_peak_load_kw = max(
+            0.0, float(self.sizing_cfg.get("resilience_peak_load_kw", 0.0))
+        )
+        self.resilience_outage_energy_kwh = max(
+            0.0, float(self.sizing_cfg.get("resilience_outage_energy_kwh", 0.0))
+        )
 
     def c_eds_at_slot(self, slot: int, dt_h: float) -> float:
         hour = int((slot * dt_h) % 24)
@@ -296,6 +307,11 @@ class Parameters:
         model.alpha_PV_year1 = pyo.Param(initialize=max(0.0, self.pv_degradation_year1_frac))
         model.alpha_PV_linear = pyo.Param(initialize=max(0.0, self.pv_degradation_linear_frac))
         model.d_PV_y = pyo.Param(model.Y, initialize=lambda _, y: self.pv_retention_factor(int(y)))
+        model.f_outage_service_min = pyo.Param(
+            initialize=self.minimum_outage_load_served_fraction
+        )
+        model.P_resilience_peak = pyo.Param(initialize=self.resilience_peak_load_kw)
+        model.E_resilience_window = pyo.Param(initialize=self.resilience_outage_energy_kwh)
 
 
 class Load:
@@ -318,6 +334,18 @@ class Load:
             model.C,
             model.Y,
             rule=lambda m, t, s, c, y: m.P_L_shed[t, s, c, y] <= m.P_L[t, s],
+        )
+        model.OutageMinimumLoadService = pyo.Constraint(
+            model.T,
+            model.S,
+            model.C,
+            model.Y,
+            rule=lambda m, t, s, c, y: (
+                m.P_L_shed[t, s, c, y]
+                <= (1.0 - m.f_outage_service_min) * m.P_L[t, s]
+            )
+            if c != "c0" and t in m.W[c]
+            else pyo.Constraint.Skip,
         )
 
 
@@ -496,6 +524,16 @@ class BESS:
         model.BESSYearEOL = pyo.Constraint(
             model.Y,
             rule=lambda m, y: m.E_BESS_year[y] >= m.E_BESS_EOL_frac * m.E_hat_BESS,
+        )
+        model.BESSResiliencePowerAdequacy = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: m.kappa_BESS * m.E_BESS_year[y]
+            >= m.f_outage_service_min * m.P_resilience_peak,
+        )
+        model.BESSResilienceEnergyAdequacy = pyo.Constraint(
+            model.Y,
+            rule=lambda m, y: m.DoD_BESS * m.eta_BESS_d * m.E_BESS_year[y]
+            >= m.f_outage_service_min * m.E_resilience_window,
         )
 
         model.BESSChargeCRate = pyo.Constraint(
@@ -839,7 +877,12 @@ class MicrogridDesign:
             "cyclic_daily_soc": True,
             "optimized_cyclic_initial_soc": True,
             "positive_probability_scenarios_only": not self.param.include_zero_prob_scenarios,
-            "sizing_model_version": 2,
+            "minimum_outage_load_served_fraction": (
+                self.param.minimum_outage_load_served_fraction
+            ),
+            "resilience_peak_load_kw": self.param.resilience_peak_load_kw,
+            "resilience_outage_energy_kwh": self.param.resilience_outage_energy_kwh,
+            "sizing_model_version": 3,
         }
         return m
 
@@ -888,6 +931,25 @@ class MicrogridDesign:
             for y in m.Y
         }
         valid_capacity = [v for v in yearly_capacity.values() if v is not None]
+        service_fraction = _safe(m.f_outage_service_min) or 0.0
+        resilience_power_margin = {
+            int(y): (
+                _safe(m.kappa_BESS * m.E_BESS_year[y])
+                - service_fraction * (_safe(m.P_resilience_peak) or 0.0)
+            )
+            if yearly_capacity[int(y)] is not None
+            else None
+            for y in m.Y
+        }
+        resilience_energy_margin = {
+            int(y): (
+                _safe(m.DoD_BESS * m.eta_BESS_d * m.E_BESS_year[y])
+                - service_fraction * (_safe(m.E_resilience_window) or 0.0)
+            )
+            if yearly_capacity[int(y)] is not None
+            else None
+            for y in m.Y
+        }
         cycle_residuals = [_safe(con.body) for con in m.BESSCycleClosure.values()]
         valid_cycle_residuals = [abs(v) for v in cycle_residuals if v is not None]
         simultaneous_max_by_year = {}
@@ -927,6 +989,8 @@ class MicrogridDesign:
             ),
             "BESS_simultaneous_charge_discharge_by_year_kw": simultaneous_max_by_year,
             "BESS_weighted_simultaneous_overlap_by_year_kwh_day": simultaneous_weighted_by_year,
+            "resilience_power_margin_by_year_kw": resilience_power_margin,
+            "resilience_energy_margin_by_year_kwh": resilience_energy_margin,
             "d_PV_y": {int(y): _safe(m.d_PV_y[y]) for y in m.Y},
             "CAPEX": _safe(m.CAPEX),
             "OPEX_day": _safe(m.OPEX_day[first_y]),

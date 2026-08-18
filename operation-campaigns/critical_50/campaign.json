@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "campaign_id": "critical_50",
+  "status": "pending",
+  "sizing_artifact": "operation-campaigns/critical_50/sizing_artifact.json",
+  "sizing_artifact_sha256": "fde5658e6177a1bdc3e22b98994126a19c6f426ed668fa599fec5403c5dc919e",
+  "parameters": "data/parameters.json",
+  "parameters_sha256": "ae414f9a0710e6f1f8f897a225e69b237716982dabf993838db9dc6ad6deba6d",
+  "pv_size_kw": 2.7170730410339657e-10,
+  "bess_size_kwh": 6.516808880516698,
+  "bess_power_kw": 2.606723552206679,
+  "operation_days": 120,
+  "mesh_forecaster_configurations": 81,
+  "monthly_runs": 972,
+  "commands": [
+    "python experiments/12_corrected_pipeline.py --workers 4 --n-iters 2880 --parameters data/parameters.json --sizing-artifact operation-campaigns/critical_50/sizing_artifact.json --campaign-id critical_50 --out-root outputs/sweeps/critical_50 --stage mesh",
+    "python experiments/12_corrected_pipeline.py --workers 4 --n-iters 2880 --parameters data/parameters.json --sizing-artifact operation-campaigns/critical_50/sizing_artifact.json --campaign-id critical_50 --out-root outputs/sweeps/critical_50 --stage annual-mesh",
+    "python experiments/14_consolidate_reference_results.py --campaign-root outputs/sweeps/critical_50 --campaign-id critical_50",
+    "python experiments/15_baseline_comparison.py --campaign-root outputs/sweeps/critical_50 --campaign-id critical_50 --workers 4",
+    "python experiments/13_generate_publication_artifacts.py --campaign-root outputs/sweeps/critical_50 --campaign-id critical_50"
+  ]
+}

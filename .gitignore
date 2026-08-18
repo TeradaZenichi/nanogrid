@@ -6,12 +6,13 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-outputs/
-Results/
-Results-v*/
-results-old/
+/outputs/
 tmp/
-figures/
+/figures/
 predictions/
 PV Profiles/
 .old/
+
+# Compact solved sizing artifacts under operation-campaigns/ are intentional
+# repository inputs and must remain versionable across clones and commits.
+paper/

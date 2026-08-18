@@ -1,16 +1,11 @@
-# -*- coding: utf-8 -*-
-"""Closed-loop simulation drivers: rolling-horizon MPC and receding stochastic plan.
-
-Both run a GridEnv plant, write the case artifacts (parameters_used.json,
-outage_calendar.json, operation_final.csv, metrics.json) and return the
-metrics dict. Cases with an existing metrics.json are skipped (resume).
-"""
+"""Closed-loop drivers for MPC and receding stochastic operation."""
 
 from __future__ import annotations
 
 import json
 import hashlib
 import math
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +14,8 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from env.grid_env import GridEnv
+from .artifacts import read_operation, write_operation, write_stochastic_plan
+from .baseline import BASELINE_MODEL_VERSION, BaselineController, run_baseline_closed_loop
 from .closed_loop import run_mpc_closed_loop
 from .ongrid import OnGridMPC
 from .stochastic import OnGridStochasticOperation
@@ -27,11 +24,31 @@ from .utils import build_dt_vector, outage_hazard_rate_per_hour
 DEFAULT_LOAD_CSV = "data/load_5min_test.csv"
 DEFAULT_PV_CSV = "data/pv_5min_test.csv"
 
-# Solver selection (Gurobi -> HiGHS) and fast method live in opt.utils.solve_model.
 DEFAULT_SOLVER_OPTS = {"time_limit": 120, "threads": 1, "mip_gap": 0.01}
 DEFAULT_STOCH_SOLVER_OPTS = {"time_limit": 1200, "threads": 8, "mip_gap": 0.01}
-OPERATION_MODEL_VERSION = "2026.08-continuous-shed-strict-balance-v5"
+OPERATION_MODEL_VERSION = "2026.08-continuous-shed-strict-balance-v6"
 COST_ACCOUNTING_VERSION = "realized-grid-reliability-plus-throughput-v1"
+CACHE_COMPATIBLE_OPERATION_MODELS = {
+    "2026.08-continuous-shed-strict-balance-v5": (
+        "v6 adds a fail-only on-grid discharge correction after export and "
+        "PV curtailment are exhausted"
+    ),
+}
+CACHE_PHYSICAL_LIMITS = {
+    "max_abs_power_balance_residual_kw": 1e-6,
+    "max_grid_exchange_during_outage_kw": 1e-6,
+    "max_bess_energy_bound_violation_kwh": 1e-9,
+    "max_bess_energy_transition_residual_kwh": 1e-9,
+    "max_plant_simultaneous_ch_dis_kw": 1e-6,
+}
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    os.replace(temporary, path)
 
 
 def parameter_fingerprint(params: dict) -> str:
@@ -53,26 +70,24 @@ def validate_time_mesh(params: dict) -> None:
         dt1_min=int(params["time"]["timestep_1_min"]),
         dt2_min=int(params["time"]["timestep_2_min"]),
     )
-    # Parameter preparation constructs the fixed outage support without
-    # instantiating or calling a solver.
     OnGridMPC(params, relaxation=True).param.build_time_data(datetime(2000, 1, 1))
 
 
 def validate_sized_system(params: dict) -> None:
-    '''Require traceable sizing output before any operational simulation.'''
-    info = params.get('sizing_case_applied')
+    """Require traceable sizing output before operational simulation."""
+    info = params.get("sizing_case_applied")
     if not isinstance(info, dict):
         raise ValueError(
-            'Operational simulations require a sizing result. '
-            'Load parameters with opt.utils.load_sized_parameters().'
+            "Operational simulations require a sizing result. "
+            "Load parameters with opt.utils.load_sized_parameters()."
         )
     required = {
-        'case', 'source', 'source_sha256', 'operation_year',
-        'P_hat_PV_kw', 'E_hat_BESS_kwh', 'BESS_Pmax_kw',
+        "case", "source", "source_sha256", "operation_year",
+        "P_hat_PV_kw", "E_hat_BESS_kwh", "BESS_Pmax_kw",
     }
     missing = sorted(required.difference(info))
     if missing:
-        raise ValueError(f'Incomplete sizing provenance; missing fields: {missing}')
+        raise ValueError(f"Incomplete sizing provenance; missing fields: {missing}")
     if int(info['operation_year']) != 1:
         raise ValueError('The current operational campaign must use sizing year 1')
 
@@ -99,9 +114,7 @@ def _prepare_case_dir(params: dict, out_dir: Path, run_config: dict) -> Path:
         **run_config,
         "run_fingerprint_sha256": _run_fingerprint(run_config),
     }
-    (out_dir / "parameters_used.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    _write_json(out_dir / "parameters_used.json", payload)
     return out_dir
 
 
@@ -256,14 +269,41 @@ def _finish_case(env: GridEnv, out_dir: Path, metrics: Dict[str, Any]) -> Dict[s
     )
     df = env.to_dataframe()
     if not df.empty:
-        df.to_csv(out_dir / "operation_final.csv", index=True)
+        write_operation(df, out_dir)
         metrics["operation_rows"] = int(len(df))
         metrics.update(_operation_cost_metrics(df, env.p))
         metrics.update(_operation_physical_metrics(df, env.p))
-    (out_dir / "metrics.json").write_text(
-        json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    _write_json(out_dir / "metrics.json", metrics)
     return metrics
+
+
+def _cache_physics_passes(metrics: Dict[str, Any]) -> bool:
+    for field, limit in CACHE_PHYSICAL_LIMITS.items():
+        try:
+            value = float(metrics[field])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not math.isfinite(value) or value > limit:
+            return False
+    return True
+
+
+def _migrate_cached_parameters(out_dir: Path, previous_version: str, reason: str) -> None:
+    path = out_dir / "parameters_used.json"
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    model = dict(payload.get("_operation_model", {}) or {})
+    model.update(
+        version=OPERATION_MODEL_VERSION,
+        cache_compatible_from=previous_version,
+        cache_compatibility_reason=reason,
+    )
+    payload["_operation_model"] = model
+    _write_json(path, payload)
 
 
 def _cached_metrics(
@@ -277,7 +317,11 @@ def _cached_metrics(
         return None
     try:
         metrics = json.loads(path.read_text(encoding="utf-8"))
-        if metrics.get("operation_model_version") != OPERATION_MODEL_VERSION:
+        cached_version = str(metrics.get("operation_model_version", ""))
+        compatibility_reason = None
+        if cached_version != OPERATION_MODEL_VERSION:
+            compatibility_reason = CACHE_COMPATIBLE_OPERATION_MODELS.get(cached_version)
+        if cached_version != OPERATION_MODEL_VERSION and compatibility_reason is None:
             print(f'[stale] {Path(out_dir).name}: operation model changed; re-running case')
             return None
         expected_params = parameter_fingerprint(params)
@@ -292,19 +336,33 @@ def _cached_metrics(
         if metrics.get('sizing_source_sha256') != expected:
             print(f'[stale] {Path(out_dir).name}: sizing provenance changed; re-running case')
             return None
-        operation_path = Path(out_dir) / "operation_final.csv"
-        if operation_path.exists():
-            operation_df = pd.read_csv(operation_path)
+        changed = False
+        try:
+            operation_df = read_operation(out_dir)
             reconstructed = {
                 **_operation_cost_metrics(operation_df, params),
                 **_operation_physical_metrics(operation_df, params),
             }
             if any(metrics.get(key) != value for key, value in reconstructed.items()):
                 metrics.update(reconstructed)
-                path.write_text(
-                    json.dumps(metrics, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                changed = True
+        except FileNotFoundError:
+            if compatibility_reason is not None:
+                print(f'[stale] {Path(out_dir).name}: compatible cache has no operation artifact')
+                return None
+        if compatibility_reason is not None:
+            if not _cache_physics_passes(metrics):
+                print(f'[stale] {Path(out_dir).name}: cached physical audit failed')
+                return None
+            metrics.update(
+                operation_model_version=OPERATION_MODEL_VERSION,
+                operation_model_compatible_from=cached_version,
+                operation_model_compatibility_reason=compatibility_reason,
+            )
+            _migrate_cached_parameters(Path(out_dir), cached_version, compatibility_reason)
+            changed = True
+        if changed:
+            _write_json(path, metrics)
         return metrics
     except (OSError, json.JSONDecodeError):
         return None
@@ -377,9 +435,9 @@ def simulate_stochastic(
                 f"[stochastic] solve {n_solves} at {now}: status={last_status} "
                 f"term={last_term} time={dt:.1f}s"
             )
-            (plans_dir / f"plan_{now.strftime('%Y%m%dT%H%M')}.json").write_text(
-                json.dumps(operation.extract_full_solution(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
+            write_stochastic_plan(
+                operation.extract_full_solution(),
+                plans_dir / f"plan_{now.strftime('%Y%m%dT%H%M')}.parquet",
             )
             # relaxation exactness check: should stay at zero
             max_simultaneity_kw = max(
@@ -511,6 +569,74 @@ def simulate_mpc(
         "avg_solve_time_s": loop.average_solve_time_s,
         "total_time_s": float(loop.total_time_s),
         "max_simultaneous_ch_dis_kw": float(loop.max_simultaneous_ch_dis_kw),
+        "run_start_ts": run_config["start_ts"],
+        "run_fingerprint_sha256": _run_fingerprint(run_config),
+    }
+    return _finish_case(env, out_dir, metrics)
+
+
+def simulate_baseline(
+    params: dict,
+    controller: BaselineController,
+    start_ts,
+    n_iters: int,
+    out_dir,
+    load_csv: str = DEFAULT_LOAD_CSV,
+    pv_csv: str = DEFAULT_PV_CSV,
+    progress_every: int = 288,
+    resume: bool = True,
+) -> Dict[str, Any]:
+    """Run one causal rule-based controller through the common plant model."""
+    validate_sized_system(params)
+    run_config = {
+        "controller": "baseline",
+        "baseline_name": str(controller.name),
+        "baseline_class": f"{type(controller).__module__}.{type(controller).__qualname__}",
+        "baseline_version": str(controller.version),
+        "baseline_model_version": BASELINE_MODEL_VERSION,
+        "baseline_configuration": controller.configuration(),
+        "start_ts": pd.Timestamp(start_ts).isoformat(),
+        "n_iters": int(n_iters),
+        "load_csv": str(load_csv),
+        "pv_csv": str(pv_csv),
+    }
+    if resume:
+        cached = _cached_metrics(out_dir, params, run_config)
+        if cached is not None:
+            print(f"[skip] {Path(out_dir).name}: already complete (metrics.json found)")
+            return cached
+
+    validate_time_mesh(params)
+    out_dir = _prepare_case_dir(params, Path(out_dir), run_config)
+    env = _make_env(params, load_csv, pv_csv, start_ts, n_iters, out_dir)
+    loop = run_baseline_closed_loop(
+        env=env,
+        controller=controller,
+        n_iters=int(n_iters),
+        progress_every=progress_every,
+    )
+    metrics = {
+        "controller": "baseline",
+        "baseline_name": str(controller.name),
+        "baseline_version": str(controller.version),
+        "baseline_model_version": BASELINE_MODEL_VERSION,
+        "baseline_configuration": controller.configuration(),
+        "status": "ok",
+        "termination": "completed",
+        "horizon_hours": int(params["time"]["horizon_hours"]),
+        "timestep_1_min": int(params["time"]["timestep_1_min"]),
+        "timestep_2_min": int(params["time"]["timestep_2_min"]),
+        "n_iters": int(n_iters),
+        "n_ongrid_steps": int(loop.n_ongrid_steps),
+        "n_offgrid_steps": int(loop.n_offgrid_steps),
+        "n_solve_ok": 0,
+        "n_solve_fail": 0,
+        "total_solve_time_s": 0.0,
+        "avg_solve_time_s": None,
+        "total_action_time_s": float(loop.total_action_time_s),
+        "avg_action_time_s": loop.average_action_time_s,
+        "total_time_s": float(loop.total_time_s),
+        "max_simultaneous_ch_dis_kw": 0.0,
         "run_start_ts": run_config["start_ts"],
         "run_fingerprint_sha256": _run_fingerprint(run_config),
     }

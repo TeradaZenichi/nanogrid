@@ -69,8 +69,49 @@ def _complete_summary():
 
 
 class CorrectedPipelineTests(unittest.TestCase):
+    def test_run_tasks_preserves_and_upserts_existing_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "summary.csv"
+            tasks = [
+                PIPELINE._task(
+                    "test", "ideal", {"h": 12, "t1": 5, "t2": 30},
+                    "2009-05-01", 1, Path(tmp) / "case-1",
+                    labels={"month": "2009-05"}, campaign_id="test",
+                ),
+                PIPELINE._task(
+                    "test", "prototype", {"h": 12, "t1": 5, "t2": 30},
+                    "2009-06-01", 1, Path(tmp) / "case-2",
+                    labels={"month": "2009-06"}, campaign_id="test",
+                ),
+            ]
+            pd.DataFrame(
+                [{"case_id": tasks[0]["case_id"], "status": "old"}]
+            ).to_csv(summary_path, index=False)
+
+            def result(task):
+                return {"case_id": task["case_id"], "status": "ok"}
+
+            with patch.object(PIPELINE, "execute_task", side_effect=result):
+                summary = PIPELINE.run_tasks(tasks, 1, summary_path)
+
+            persisted = pd.read_csv(summary_path)
+            state = json.loads(
+                (summary_path.parent / "pipeline_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(len(summary), 2)
+        self.assertEqual(len(persisted), 2)
+        self.assertEqual(set(persisted["status"]), {"ok"})
+        self.assertEqual(state["completed"], 2)
+        self.assertEqual(state["recovered_summary_rows"], 1)
+
     def test_temporal_mesh_campaign_includes_lstm(self):
-        self.assertEqual(PIPELINE.DEFAULT_OUT_ROOT, Path("Results"))
+        self.assertEqual(
+            PIPELINE.DEFAULT_OUT_ROOT,
+            Path("outputs") / "sweeps" / "economic",
+        )
         self.assertEqual(
             PIPELINE.EVALUATION_CONTROLLERS,
             ("ideal", "prototype", "lstm"),
@@ -116,9 +157,79 @@ class CorrectedPipelineTests(unittest.TestCase):
             72,
         )
 
+    def test_distributed_campaign_cli_accepts_portable_sizing(self):
+        args = PIPELINE.parse_args(
+            [
+                '--stage', 'mesh',
+                '--campaign-id', 'critical_50',
+                '--sizing-artifact', 'operation-campaigns/critical_50/sizing_artifact.json',
+                '--out-root', 'outputs/sweeps/critical_50',
+            ]
+        )
+        self.assertEqual(args.campaign_id, 'critical_50')
+        self.assertEqual(args.stage, 'mesh')
+        self.assertEqual(args.out_root, Path('outputs/sweeps/critical_50'))
+        self.assertEqual(
+            args.sizing_artifact,
+            Path('operation-campaigns/critical_50/sizing_artifact.json'),
+        )
+
+    def test_default_smoke_output_is_outside_canonical_results(self):
+        output = PIPELINE.resolve_output_root("smoke", PIPELINE.DEFAULT_OUT_ROOT)
+        self.assertEqual(output, PIPELINE.DEFAULT_SMOKE_ROOT.resolve())
+
+        explicit = Path("outputs/sweeps/custom-smoke")
+        self.assertEqual(
+            PIPELINE.resolve_output_root("smoke", explicit),
+            explicit.resolve(),
+        )
+
+    def test_manifest_rejects_mixed_sizing_before_overwriting_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "campaign-inputs"
+            inputs.mkdir()
+            frozen = inputs / "sizing_artifact.json"
+            frozen.write_text("frozen", encoding="utf-8")
+            parameters = root / "parameters.json"
+            parameters.write_text("{}", encoding="utf-8")
+            candidate = root / "candidate.json"
+            candidate.write_text("candidate", encoding="utf-8")
+            (root / "campaign_manifest.json").write_text(
+                json.dumps({
+                    "campaign_id": "economic",
+                    "portable_inputs": {
+                        "sizing_artifact_sha256": "different",
+                        "parameters_sha256": "different",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                out_root=root,
+                parameters=parameters,
+                sizing_artifact=candidate,
+                campaign_id="economic",
+            )
+            loaded = {
+                "sizing_case_applied": {
+                    "source": str(candidate),
+                    "case": "candidate",
+                    "P_hat_PV_kw": 1.0,
+                    "E_hat_BESS_kwh": 1.0,
+                    "BESS_Pmax_kw": 1.0,
+                }
+            }
+            with (
+                patch.object(PIPELINE, "load_sized_parameters_from_artifact", return_value=loaded),
+                self.assertRaises(RuntimeError),
+            ):
+                PIPELINE.write_manifest(args)
+            self.assertEqual(frozen.read_text(encoding="utf-8"), "frozen")
+
     def test_final_forecast_uses_month_specific_outage_seeds(self):
         args = SimpleNamespace(
-            out_root=Path("Results"),
+            out_root=Path("outputs"),
             forecast_controllers="ideal,prototype,lstm",
             n_iters=3,
             fresh=False,
@@ -174,7 +285,7 @@ class CorrectedPipelineTests(unittest.TestCase):
 
     def test_expanded_robustness_uses_four_seasonal_windows(self):
         args = SimpleNamespace(
-            out_root=Path("Results"),
+            out_root=Path("outputs"),
             n_iters=3,
             fresh=False,
             workers=4,

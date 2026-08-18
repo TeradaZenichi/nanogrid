@@ -86,6 +86,13 @@
     "pv_degradation_linear_frac": 0.004,
     "pv_degradation_reference": "Trina Vertex S+ datasheet: first-year degradation <= 1%, subsequent annual degradation <= 0.4%."
   },
+  "resilience_sizing": {
+    "minimum_outage_load_served_fractions": [0.0, 0.5, 1.0],
+    "E_BESS_size_max_kwh": 25.0,
+    "stress_scenarios": "Training-set night peak and maximum 2-hour load energy, both paired with zero PV and assigned zero objective probability.",
+    "validation_split": "test",
+    "replacement_policy": "No replacement; power and energy adequacy are enforced in every planning year."
+  },
   "sensitivity": {
     "discount_rate": [0.05, 0.08, 0.12],
     "c_shed_per_kwh": [2.0, 5.0, 10.0],

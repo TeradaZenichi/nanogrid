@@ -1,23 +1,4 @@
-"""One-at-a-time sensitivity analysis for degradation-aware PV/BESS sizing.
-
-The script is intentionally lighter than ``01_sizing.py``: it does not export
-the complete operation table for every planning year.  Each case stores the
-sizing decisions, annual trajectories, expected energy flows, costs, and model
-audits required to choose a defensible sizing before running the operational
-experiments.
-
-Examples (run from the repository root):
-
-    python experiments/01_1_sizing.py --list-cases
-    python experiments/01_1_sizing.py --dry-run
-    python experiments/01_1_sizing.py                  # priority factors
-    python experiments/01_1_sizing.py --group extended
-    python experiments/01_1_sizing.py --all
-    python experiments/01_1_sizing.py --case baseline --case c_shed__25
-
-Existing successful cases are resumed when their effective configuration has
-not changed.  Use ``--force`` to solve them again.
-"""
+"""Run the one-at-a-time sensitivity analysis for PV/BESS sizing."""
 
 from __future__ import annotations
 
@@ -48,7 +29,7 @@ sys.path.insert(0, str(ROOT))
 from sizing import MicrogridDesign
 
 
-DEFAULT_RESULTS_ROOT = ROOT / "Results" / "sizing-sensitivity"
+DEFAULT_RESULTS_ROOT = ROOT / "outputs" / "sizing-sensitivity"
 DEFAULT_PARAMETERS = ROOT / "data" / "parameters.json"
 GULLIVER_FONT_PATH = ROOT / "data" / "Gulliver.otf"
 
@@ -195,8 +176,6 @@ def _apply_factor(params: dict[str, Any], factor: Factor, value: float) -> dict[
         _set_nested(cfg, factor.path, float(value))
         return cfg
 
-    # Cycle life changes both physical fade and the marginal throughput cost.
-    # Keeping the two derived quantities coupled avoids an inconsistent case.
     cycle_life = float(value)
     if cycle_life <= 0.0:
         raise ValueError("BESS cycle life must be positive")
@@ -764,7 +743,7 @@ def main() -> int:
     if args.dry_run:
         _print_cases(selected)
         print(f"\nSelected cases: {len(selected)}")
-        print(f"Results root: {results_root}")
+        print(f"Output root: {results_root}")
         return 0
 
     font_family = _configure_gulliver()

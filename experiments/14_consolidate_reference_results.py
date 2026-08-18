@@ -1,11 +1,4 @@
-"""Consolidate and audit the annual temporal-mesh campaign offline.
-
-No optimization is executed here.  The script resolves the May trajectories
-from ``Results/01-mesh`` and the remaining eleven months from
-``Results/02-seasonal-mesh``, reconstructs realized operational metrics from
-each ``operation_final.csv``, and writes a canonical reference package for
-future controller-baseline comparisons.
-"""
+"""Consolidate and audit the annual temporal-mesh results offline."""
 
 from __future__ import annotations
 
@@ -24,14 +17,18 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from opt.artifacts import operation_artifact_path, read_operation
+from opt.campaigns import (
+    CampaignProvenance,
+    campaign_layout,
+    load_campaign_provenance,
+    validate_parameter_provenance,
+    validate_summary_provenance,
+)
 from opt.operation import _operation_cost_metrics, _operation_physical_metrics
 
 
-DEFAULT_SUMMARY = ROOT / "Results" / "02-seasonal-mesh" / "summary.csv"
-DEFAULT_MAY_ROOT = ROOT / "Results" / "01-mesh"
-DEFAULT_SEASONAL_ROOT = ROOT / "Results" / "02-seasonal-mesh"
-DEFAULT_CHAMPION = DEFAULT_SEASONAL_ROOT / "champion_mesh.json"
-DEFAULT_OUTPUT = DEFAULT_SEASONAL_ROOT / "reference"
+DEFAULT_CAMPAIGN_ROOT = ROOT / "outputs" / "sweeps" / "economic"
 
 EXPECTED_CONTROLLERS = ("ideal", "lstm", "prototype")
 EXPECTED_MONTHS = (
@@ -59,7 +56,6 @@ PHYSICAL_FIELDS = (
 )
 REQUIRED_ARTIFACTS = (
     "metrics.json", "parameters_used.json", "outage_calendar.json",
-    "operation_final.csv",
 )
 
 
@@ -146,6 +142,8 @@ def validate_summary(summary: pd.DataFrame) -> None:
 
 def selected_mesh(path: Path) -> dict[str, int]:
     data = json.loads(path.read_text(encoding="utf-8"))
+    if all(name in data for name in ("h", "t1", "t2")):
+        return {name: int(data[name]) for name in ("h", "t1", "t2")}
     selected = data.get("selected", [])
     if len(selected) != 1:
         raise RuntimeError(f"Expected one selected mesh in {path}")
@@ -223,9 +221,15 @@ def compare_metric(
 
 def audit_case(
     row: pd.Series, may_root: Path, seasonal_root: Path, project_root: Path,
+    provenance: CampaignProvenance,
 ) -> dict[str, Any]:
     case_dir = case_dir_for(row, may_root, seasonal_root)
     missing = [name for name in REQUIRED_ARTIFACTS if not (case_dir / name).exists()]
+    try:
+        operation_path = operation_artifact_path(case_dir)
+    except FileNotFoundError:
+        operation_path = case_dir / "operation_final.parquet"
+        missing.append("operation_final.parquet|operation_final.csv")
     base = {
         "month": str(row["month"]),
         "controller_name": str(row["controller_name"]),
@@ -235,6 +239,8 @@ def audit_case(
         "t2": int(row["t2"]),
         "source_stage": "01-mesh" if str(row["month"]) == EXPECTED_MONTHS[0] else "02-seasonal-mesh",
         "case_dir": case_dir.relative_to(project_root).as_posix(),
+        "campaign_id": provenance.campaign_id,
+        "sizing_source_sha256": provenance.sizing_sha256,
         "artifacts_complete": not missing,
         "missing_artifacts": ";".join(missing),
     }
@@ -245,13 +251,13 @@ def audit_case(
     params_path = case_dir / "parameters_used.json"
     metrics_path = case_dir / "metrics.json"
     calendar_path = case_dir / "outage_calendar.json"
-    operation_path = case_dir / "operation_final.csv"
     params = json.loads(params_path.read_text(encoding="utf-8"))
     saved_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-    operation = pd.read_csv(operation_path)
+    operation = read_operation(operation_path)
     core_params = {
         key: value for key, value in params.items() if not key.startswith("_operation_")
     }
+    validate_parameter_provenance(core_params, provenance, str(case_dir))
 
     reconstructed = _operation_cost_metrics(operation, params)
     reconstructed.update(_operation_physical_metrics(operation, params))
@@ -332,6 +338,8 @@ def aggregate_selected(cases: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for controller, group in cases.groupby("controller_name", sort=True):
         row: dict[str, Any] = {
+            "campaign_id": str(group["campaign_id"].iloc[0]),
+            "sizing_source_sha256": str(group["sizing_source_sha256"].iloc[0]),
             "controller_name": controller,
             "windows": int(group["month"].nunique()),
             "trajectory_count": int(len(group)),
@@ -351,12 +359,14 @@ def aggregate_selected(cases: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_readme(output: Path, mesh: dict[str, int], manifest: dict[str, Any]) -> None:
+def write_readme(
+    output: Path, mesh: dict[str, int], manifest: dict[str, Any], campaign_root: Path,
+) -> None:
     text = f"""# Canonical operational reference set
 
 This directory consolidates the existing annual temporal-mesh campaign without
-running any optimization. May (`2009-05`) is referenced from `Results/01-mesh`;
-the other eleven months are referenced from `Results/02-seasonal-mesh`.
+running any optimization. May (`2009-05`) is referenced from the campaign's
+`01-mesh`; the other eleven months are referenced from `02-seasonal-mesh`.
 Source trajectories remain in their pipeline-stage directories to avoid data
 duplication and broken reproduction paths.
 
@@ -385,7 +395,7 @@ min, and $\\Delta t_2={mesh['t2']}$ min.
 ## Reproduction
 
 ```powershell
-.\\.venv\\Scripts\\python.exe experiments\\14_consolidate_reference_results.py
+.\\.venv\\Scripts\\python.exe experiments\\14_consolidate_reference_results.py --campaign-root {campaign_root.relative_to(ROOT).as_posix()} --campaign-id {manifest['campaign_id']}
 ```
 """
     (output / "README.md").write_text(text, encoding="utf-8")
@@ -393,40 +403,47 @@ min, and $\\Delta t_2={mesh['t2']}$ min.
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--summary", type=Path, default=DEFAULT_SUMMARY)
-    parser.add_argument("--may-root", type=Path, default=DEFAULT_MAY_ROOT)
-    parser.add_argument("--seasonal-root", type=Path, default=DEFAULT_SEASONAL_ROOT)
-    parser.add_argument("--champion", type=Path, default=DEFAULT_CHAMPION)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--campaign-root", type=Path, default=DEFAULT_CAMPAIGN_ROOT)
+    parser.add_argument("--campaign-id")
+    parser.add_argument("--summary", type=Path)
+    parser.add_argument("--may-root", type=Path)
+    parser.add_argument("--seasonal-root", type=Path)
+    parser.add_argument("--champion", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+
+    args.campaign_root = args.campaign_root.resolve()
+    layout = campaign_layout(args.campaign_root)
+    args.summary = (args.summary or layout["summary"]).resolve()
+    args.may_root = (args.may_root or layout["may"]).resolve()
+    args.seasonal_root = (args.seasonal_root or layout["seasonal"]).resolve()
+    args.champion = (args.champion or layout["champion"]).resolve()
+    args.output = (args.output or layout["reference"]).resolve()
+    provenance = load_campaign_provenance(args.campaign_root, args.campaign_id)
 
     summary = pd.read_csv(args.summary)
     validate_summary(summary)
+    validate_summary_provenance(summary, provenance, "annual mesh summary")
     mesh = selected_mesh(args.champion)
     args.output.mkdir(parents=True, exist_ok=True)
 
     records = []
     ordered = summary.sort_values(["month", "controller_name", "h", "t1", "t2"])
     for index, (_, row) in enumerate(ordered.iterrows(), start=1):
-        records.append(audit_case(row, args.may_root, args.seasonal_root, ROOT))
+        records.append(
+            audit_case(row, args.may_root, args.seasonal_root, ROOT, provenance)
+        )
         if index % 100 == 0 or index == len(ordered):
             print(f"Audited {index}/{len(ordered)} cases", flush=True)
 
-    cases = pd.DataFrame(records).sort_values(
-        ["month", "controller_name", "h", "t1", "t2"]
-    )
+    cases = pd.DataFrame(records).sort_values(["month", "controller_name", "h", "t1", "t2"])
     pairs = pairing_audit(cases)
-    chosen = cases[
-        (cases["h"] == mesh["h"])
-        & (cases["t1"] == mesh["t1"])
-        & (cases["t2"] == mesh["t2"])
-    ].copy()
-
-    # Solve-time fields are already in the annual summary and are joined only
-    # for reporting; all physical and cost values above are reconstructed.
-    reporting = summary[
-        ["month", "controller_name", "combo", "avg_solve_time_s", "total_time_s"]
-    ]
+    selected = ((cases["h"] == mesh["h"]) & (cases["t1"] == mesh["t1"])
+                & (cases["t2"] == mesh["t2"]))
+    chosen = cases[selected].copy()
+    reporting = summary[[
+        "month", "controller_name", "combo", "avg_solve_time_s", "total_time_s"
+    ]]
     chosen = chosen.merge(
         reporting, on=["month", "controller_name", "combo"], validate="one_to_one"
     )
@@ -443,6 +460,8 @@ def main() -> None:
 
     manifest = {
         "reference_version": "annual-operational-reference-v1",
+        "campaign_id": provenance.campaign_id,
+        "sizing_source_sha256": provenance.sizing_sha256,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "scope": "existing artifacts only; no optimization executed",
         "source_layout": {
@@ -498,7 +517,7 @@ def main() -> None:
     report_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    write_readme(args.output, mesh, manifest)
+    write_readme(args.output, mesh, manifest, args.campaign_root)
 
     complete = (
         manifest["counts"]["cases"] == EXPECTED_ROWS

@@ -1,9 +1,7 @@
-"""Causal timestamp rules shared by the hourly forecasting models.
+"""Causal timestamp rules for left-labelled hourly forecasts.
 
-The hourly LSTM models were trained with left-labelled hourly aggregates: the
-row labelled 11:00 contains the 5-min observations from 11:00 through 11:55.
-Consequently, at an arbitrary decision time only rows whose complete source
-window has already elapsed may enter the model.
+An hourly row contains samples from its label through 55 minutes later, so it
+becomes observable only after the hour has ended.
 """
 
 from __future__ import annotations
@@ -29,8 +27,4 @@ def hourly_source_end(anchor_hour, sample_minutes: int = 5) -> pd.Timestamp:
     sample_minutes = int(sample_minutes)
     if sample_minutes <= 0 or 60 % sample_minutes:
         raise ValueError("sample_minutes must be a positive divisor of 60")
-    return (
-        pd.Timestamp(anchor_hour).floor("h")
-        + pd.Timedelta(hours=1)
-        - pd.Timedelta(minutes=sample_minutes)
-    )
+    return pd.Timestamp(anchor_hour).floor("h") + pd.Timedelta(hours=1, minutes=-sample_minutes)

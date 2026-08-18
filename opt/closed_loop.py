@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Closed-loop execution routines."""
 
 from __future__ import annotations
@@ -49,8 +48,7 @@ class ClosedLoopResult:
 
 
 def run_mpc_closed_loop(*, env, mpc, forecaster, solver_opts: Mapping[str, Any],
-                        n_iters: int, controller_label: str,
-                        progress_every: int = 288) -> ClosedLoopResult:
+                        n_iters: int, controller_label: str, progress_every: int = 288) -> ClosedLoopResult:
     """Run receding-horizon MPC, applying one action per physical step.
 
     GridEnv replaces the zero external command with local emergency control

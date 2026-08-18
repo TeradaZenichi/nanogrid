@@ -1,6 +1,5 @@
-# Expose a minimal, TensorFlow-free API surface.
-# ForecastMPC (LSTM, needs TF) is imported explicitly from
-# forecasting.get_forecasting to keep this package import light.
+"""TensorFlow-free forecasting interface."""
+
 from .load_forecast import load
 from .pv_forecast import pv
 from .prototype_forecast import PerfectForecast, PrototypeForecast

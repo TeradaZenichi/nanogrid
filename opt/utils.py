@@ -1,16 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-opt/utils.py
-Reusable utilities for MPCs (Off-Grid and On-Grid).
-
-Includes:
-- time grid construction and predecessor pairs
-- creation of the contingency set (subset of T)
-- column normalization/checking
-- reading and scaling of series (PV and Load)
-- assembly of forecasts aligned with the time grid
-- helpers for capturing/saving results
-"""
+"""Shared optimization, time-grid, data and result utilities."""
 import json
 import hashlib
 import math
@@ -24,13 +12,12 @@ from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 
 
-# ---------------------------
-# Solver selection and fast defaults
-# ---------------------------
-
 _DETECTED_SOLVER: Optional[str] = None
 DEFAULT_SIZING_CASE = 'alpha_gt_0'
 DEFAULT_OPERATION_YEAR = 1
+DEFAULT_SIZING_ARTIFACT = Path(
+    'paper/sizing/economic/degradation/sizing_decision_variables.json'
+)
 
 
 def detect_solver() -> str:
@@ -125,22 +112,8 @@ def solve_model(model, tee: bool = False,
         raise
 
 
-# ---------------------------
-# Sizing -> operation bridge
-# ---------------------------
-
-def apply_sizing_case(params: Dict[str, Any],
-                      case: str,
-                      results_root: str = "Results/sizing") -> Dict[str, Any]:
-    """Copy of `params` with PV/BESS capacities taken from a sizing case.
-
-    Pmax and ramp are rescaled from the catalog ratios. The initial stored
-    energy is transferred directly from the optimized cyclic sizing state.
-    """
-    path = Path(results_root) / case / "sizing_decision_variables.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Sizing case '{case}' not found: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+def _apply_sizing_data(params: Dict[str, Any], data: Dict[str, Any],
+                       path: Path, case: str) -> Dict[str, Any]:
     dv = data.get("decision_variables", {}) or {}
     p_pv = dv.get("P_hat_PV_kw")
     e_bess = dv.get("E_hat_BESS_kwh")
@@ -181,43 +154,44 @@ def apply_sizing_case(params: Dict[str, Any],
     return out
 
 
-def load_sized_parameters(params_json: str = 'data/parameters.json',
-                          case: str = DEFAULT_SIZING_CASE,
-                          results_root: str = 'Results/sizing',
-                          operation_year: int = DEFAULT_OPERATION_YEAR) -> Dict[str, Any]:
-    '''Load catalog parameters and obligatorily apply a solved sizing case.
+def apply_sizing_artifact(params: Dict[str, Any], artifact: str | Path,
+                          case: str | None = None) -> Dict[str, Any]:
+    """Apply a standalone sizing JSON without requiring its original run tree."""
+    path = Path(artifact)
+    if not path.exists():
+        raise FileNotFoundError(f"Sizing artifact not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    case_name = str(case or data.get("case_id") or path.stem)
+    return _apply_sizing_data(params, data, path, case_name)
 
-    The current operational campaign is anchored at year 1. A different year
-    must be implemented explicitly instead of silently reusing initial
-    capacities.
-    '''
-    if int(operation_year) != 1:
-        raise NotImplementedError('Only operation_year=1 is currently supported')
 
-    params_path = Path(params_json)
-    if not params_path.exists():
-        raise FileNotFoundError(f'Parameter file not found: {params_path}')
-    sizing_path = Path(results_root) / case / 'sizing_decision_variables.json'
-    if not sizing_path.exists():
-        raise FileNotFoundError(
-            f'Sizing case {case!r} not found at {sizing_path}. Run experiments/01_sizing.py first.'
-        )
-    sizing_data = json.loads(sizing_path.read_text(encoding='utf-8'))
-    if not bool(sizing_data.get('has_loaded_solution', False)):
-        raise ValueError(f'Sizing case {case!r} has no loaded feasible solution: {sizing_path}')
-    if not bool((sizing_data.get('metadata', {}) or {}).get('cyclic_daily_soc', False)):
+def apply_sizing_case(params: Dict[str, Any],
+                      case: str,
+                      results_root: str = "outputs/sizing") -> Dict[str, Any]:
+    """Copy of `params` with PV/BESS capacities taken from a sizing case."""
+    path = Path(results_root) / case / "sizing_decision_variables.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Sizing case '{case}' not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return _apply_sizing_data(params, data, path, case)
+
+
+def _validate_sizing_artifact(data: Dict[str, Any], path: Path) -> None:
+    case = str(data.get("case_id") or path.parent.name or path.stem)
+    if not bool(data.get('has_loaded_solution', False)):
+        raise ValueError(f'Sizing case {case!r} has no loaded feasible solution: {path}')
+    metadata = data.get('metadata', {}) or {}
+    if not bool(metadata.get('cyclic_daily_soc', False)):
         raise ValueError(
-            f'Sizing case {case!r} predates cyclic daily SoC closure: {sizing_path}. '
-            'Regenerate it with experiments/01_sizing.py.'
+            f'Sizing case {case!r} predates cyclic daily SoC closure: {path}. '
+            'Regenerate the sizing artifact before operation.'
         )
-    if not bool(
-        (sizing_data.get('metadata', {}) or {}).get('optimized_cyclic_initial_soc', False)
-    ):
+    if not bool(metadata.get('optimized_cyclic_initial_soc', False)):
         raise ValueError(
-            f'Sizing case {case!r} predates optimized cyclic initial SoC: {sizing_path}. '
-            'Regenerate it with experiments/01_sizing.py.'
+            f'Sizing case {case!r} predates optimized cyclic initial SoC: {path}. '
+            'Regenerate the sizing artifact before operation.'
         )
-    cycle_residual = (sizing_data.get('model_audit', {}) or {}).get(
+    cycle_residual = (data.get('model_audit', {}) or {}).get(
         'cycle_closure_max_abs_kwh'
     )
     if cycle_residual is None or abs(float(cycle_residual)) > 1e-6:
@@ -225,32 +199,67 @@ def load_sized_parameters(params_json: str = 'data/parameters.json',
             f'Sizing case {case!r} failed its cyclic-closure audit: {cycle_residual}'
         )
 
+
+def load_sized_parameters_from_artifact(
+    params_json: str | Path,
+    sizing_artifact: str | Path,
+    operation_year: int = DEFAULT_OPERATION_YEAR,
+) -> Dict[str, Any]:
+    """Load year-1 operational parameters from one portable sizing JSON."""
+    if int(operation_year) != 1:
+        raise NotImplementedError('Only operation_year=1 is currently supported')
+    params_path = Path(params_json)
+    artifact_path = Path(sizing_artifact)
+    if not params_path.exists():
+        raise FileNotFoundError(f'Parameter file not found: {params_path}')
+    if not artifact_path.exists():
+        raise FileNotFoundError(f'Sizing artifact not found: {artifact_path}')
+    data = json.loads(artifact_path.read_text(encoding='utf-8'))
+    _validate_sizing_artifact(data, artifact_path)
     params = json.loads(params_path.read_text(encoding='utf-8'))
-    out = apply_sizing_case(params, case=case, results_root=results_root)
+    case = str(data.get('case_id') or artifact_path.parent.name or artifact_path.stem)
+    out = _apply_sizing_data(params, data, artifact_path, case)
     out['sizing_case_applied'].update(
         operation_year=1,
-        source_sha256=hashlib.sha256(sizing_path.read_bytes()).hexdigest(),
+        source_sha256=hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
         parameters_source=params_path.as_posix(),
         parameters_sha256=hashlib.sha256(params_path.read_bytes()).hexdigest(),
     )
     return out
 
 
-# ---------------------------
-# Time, time grid and contingencies
-# ---------------------------
+def load_sized_parameters(params_json: str = 'data/parameters.json',
+                          case: str = DEFAULT_SIZING_CASE,
+                          results_root: str | None = None,
+                          operation_year: int = DEFAULT_OPERATION_YEAR) -> Dict[str, Any]:
+    '''Load catalog parameters and obligatorily apply a solved sizing case.
+
+    The current operational campaign is anchored at year 1. A different year
+    must be implemented explicitly instead of silently reusing initial
+    capacities.
+    '''
+    sizing_path = (
+        DEFAULT_SIZING_ARTIFACT
+        if results_root is None
+        else Path(results_root) / case / 'sizing_decision_variables.json'
+    )
+    if not sizing_path.exists():
+        raise FileNotFoundError(
+            f'Sizing case {case!r} not found at {sizing_path}. '
+            'Run the sizing experiment and promote its audited artifact to paper/.'
+        )
+    return load_sized_parameters_from_artifact(
+        params_json=params_json,
+        sizing_artifact=sizing_path,
+        operation_year=operation_year,
+    )
+
 
 def build_dt_vector(horizon_hours: int,
                     outage_duration_hours: int,
                     dt1_min: int,
                     dt2_min: int) -> List[int]:
-    """
-    Creates a vector of steps (in minutes) for the horizon:
-      - First 'outage_duration_hours' with fine resolution (dt1_min).
-      - Remainder of the horizon with coarse resolution (dt2_min).
-
-    Completely replaces the old use of 'fine_hours'.
-    """
+    """Build fine and coarse interval durations for the prediction horizon."""
     if horizon_hours <= 0:
         raise ValueError("horizon_hours must be > 0")
     if not (0 <= outage_duration_hours <= horizon_hours):
@@ -258,12 +267,10 @@ def build_dt_vector(horizon_hours: int,
     if dt1_min <= 0 or dt2_min <= 0:
         raise ValueError("timestep_1_min and timestep_2_min must be > 0 (min)")
 
-    # fine steps during the outage window
     steps_fine = (outage_duration_hours * 60) // dt1_min
     if steps_fine * dt1_min != outage_duration_hours * 60:
         raise ValueError("outage_duration_hours * 60 must be an exact multiple of timestep_1_min")
 
-    # coarse steps in the remainder
     steps_coarse = ((horizon_hours - outage_duration_hours) * 60) // dt2_min
     if steps_coarse * dt2_min != (horizon_hours - outage_duration_hours) * 60:
         raise ValueError("(horizon_hours - outage_duration_hours) * 60 must be an exact multiple of timestep_2_min")
@@ -275,10 +282,7 @@ def build_dt_vector(horizon_hours: int,
 
 
 def build_time_grid(start_dt: datetime, dt_min: List[int]) -> List[datetime]:
-    """
-    Builds the list of timestamps T from a start time and the vector of steps in minutes.
-    Returns a list of the same size as len(dt_min), with the last index representing the end of the horizon.
-    """
+    """Build one interval-start timestamp for each duration in ``dt_min``."""
     times = [start_dt]
     for dm in dt_min[:-1]:
         times.append(times[-1] + timedelta(minutes=dm))
@@ -286,7 +290,7 @@ def build_time_grid(start_dt: datetime, dt_min: List[int]) -> List[datetime]:
 
 
 def predecessor_pairs(times: List[datetime]) -> List[Tuple[datetime, datetime]]:
-    """Creates consecutive predecessor pairs (t0, t1) from T."""
+    """Return consecutive timestamp pairs."""
     return list(zip(times[:-1], times[1:]))
 
 
@@ -463,10 +467,6 @@ def build_time_and_contingencies_from_params(params: Dict[str, Any],
     return times, contingencies
 
 
-# ---------------------------
-# Normalization / checking
-# ---------------------------
-
 def pnorm_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalizes column names (lowercase, separators to '_', no strange symbols)."""
     def _norm(name: str) -> str:
@@ -486,10 +486,6 @@ def find_column(df: pd.DataFrame, candidates: List[str]) -> str:
             return c
     raise ValueError(f"CSV must contain one of the following columns: {candidates}")
 
-
-# ---------------------------
-# Series and forecasts
-# ---------------------------
 
 def load_series_scaled(params: Dict[str, Any],
                        load_csv: str,
@@ -536,10 +532,6 @@ def slice_forecasts(times: List[datetime],
     fc_pv = {t: float(pv_series_kw.loc[t]) for t in times}
     return {"load_kw": fc_load, "pv_kw": fc_pv}
 
-
-# ---------------------------
-# Result capture / saving
-# ---------------------------
 
 def _val(v, default=0.0):
     """Tries to extract a numerical value (compatible with pyomo.environ.value)."""

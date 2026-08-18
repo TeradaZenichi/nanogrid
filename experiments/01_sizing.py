@@ -1,8 +1,4 @@
-"""PV/BESS sizing over 25 years, with and without battery degradation.
-
-Outputs go to Results/sizing/, including a Gulliver-font PDF report.
-Run from the repo root.
-"""
+"""Run the 25-year PV/BESS sizing cases and generate their report."""
 
 import json
 import sys
@@ -53,7 +49,9 @@ def _to_year_map(year_data):
     return {int(k): float(v) for k, v in year_data.items() if v is not None}
 
 
-def _extract_operation_rows(design: MicrogridDesign, yearly_capacity: dict[int, float]) -> list[dict]:
+def _extract_operation_rows(
+    design: MicrogridDesign, yearly_capacity: dict[int, float]
+) -> list[dict]:
     m = design.model
     if m is None:
         return []
@@ -115,7 +113,6 @@ def _save_figure(fig, out_dir: Path, stem: str) -> None:
 
 
 def _save_plots(out_dir: Path, payload: dict, discount_rate: float) -> None:
-
     yearly_capacity = payload.get("bess_capacity_by_year_kwh", {}) or {}
     years = sorted(int(y) for y in yearly_capacity.keys())
     caps = [yearly_capacity.get(y, yearly_capacity.get(str(y))) for y in years]
@@ -141,7 +138,10 @@ def _save_plots(out_dir: Path, payload: dict, discount_rate: float) -> None:
         discounted = [opex_by_year[y] / ((1.0 + discount_rate) ** y) for y in years]
     else:
         opex_annual = payload.get("objective_breakdown", {}).get("OPEX_annual")
-        discounted = [opex_annual / ((1.0 + discount_rate) ** y) for y in years] if (years and opex_annual is not None) else []
+        discounted = (
+            [opex_annual / ((1.0 + discount_rate) ** y) for y in years]
+            if years and opex_annual is not None else []
+        )
 
     if discounted:
         fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -269,15 +269,13 @@ def _run_case(params: dict, case_dir: Path, degradation_on: bool):
             f"|T|={len(m.T)} |S|={len(m.S)} |C|={len(m.C)} |Y|={len(m.Y)}"
         )
 
-    results = design.optimize(
-        tee=False,
-        time_limit=SOLVER_TIME_LIMIT_S,
-        threads=SOLVER_THREADS,
-    )
+    results = design.optimize(tee=False, time_limit=SOLVER_TIME_LIMIT_S, threads=SOLVER_THREADS)
     out = design.get_results()
     status = str(results.solver.status)
     term = str(results.solver.termination_condition)
-    has_solution = (status.lower() == "ok") and (term.lower() in {"optimal", "locallyoptimal", "feasible"})
+    has_solution = status.lower() == "ok" and term.lower() in {
+        "optimal", "locallyoptimal", "feasible"
+    }
 
     yearly_capacity = _to_year_map(out.get("E_BESS_year_kwh", {}))
     yearly_values = [v for v in yearly_capacity.values() if v is not None]
@@ -332,10 +330,8 @@ def _run_case(params: dict, case_dir: Path, degradation_on: bool):
     }
 
     case_dir.mkdir(parents=True, exist_ok=True)
-    (case_dir / "sizing_decision_variables.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    decision_path = case_dir / "sizing_decision_variables.json"
+    decision_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     discount_rate = float(cfg.get("sizing", {}).get("discount_rate", 0.08))
     _save_plots(case_dir, payload, discount_rate=discount_rate)
@@ -345,12 +341,10 @@ def _run_case(params: dict, case_dir: Path, degradation_on: bool):
     op_dir.mkdir(parents=True, exist_ok=True)
     if rows:
         df = pd.DataFrame(rows)
-        for year, df_y in df.groupby("year", sort=True):
-            df_y.sort_values(["slot", "scenario", "contingency"]).to_csv(
-                op_dir / f"operations_year_{int(year):02d}.csv",
-                index=False,
-            )
-        df.to_csv(op_dir / "operations_all_years.csv", index=False)
+        df.to_parquet(
+            op_dir / "operations_all_years.parquet",
+            engine="pyarrow", compression="zstd", index=False,
+        )
     elif not has_solution:
         (op_dir / "README.txt").write_text(
             (
@@ -369,49 +363,33 @@ def _run_case(params: dict, case_dir: Path, degradation_on: bool):
     return payload
 
 
-if __name__ == "__main__":
-    with open("data/parameters.json", "r", encoding="utf-8") as f:
-        params = json.load(f)
-
-    root = Path("Results/sizing")
+def main() -> None:
+    params = json.loads(Path("data/parameters.json").read_text(encoding="utf-8"))
+    root = Path("outputs/sizing")
     root.mkdir(parents=True, exist_ok=True)
-
-    case_alpha_0 = _run_case(
-        params=params,
-        case_dir=root / "alpha_eq_0",
-        degradation_on=False,
-    )
-
-    case_alpha_gt = _run_case(
-        params=params,
-        case_dir=root / "alpha_gt_0",
-        degradation_on=True,
-    )
-
     comparison = {
-        "alpha_eq_0": case_alpha_0,
-        "alpha_gt_0": case_alpha_gt,
+        "alpha_eq_0": _run_case(params, root / "alpha_eq_0", False),
+        "alpha_gt_0": _run_case(params, root / "alpha_gt_0", True),
     }
-    (root / "comparison_alpha_cases.json").write_text(
-        json.dumps(comparison, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    comparison_path = root / "comparison_alpha_cases.json"
+    comparison_path.write_text(
+        json.dumps(comparison, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
     discount_rate = float(params.get("sizing", {}).get("discount_rate", 0.08))
     report_path = _save_comparison_report(root, comparison, discount_rate)
+    manifest = {
+        "report_pdf": report_path.as_posix(),
+        "font_family": GULLIVER_FONT_FAMILY,
+        "font_file": GULLIVER_FONT_PATH.as_posix(),
+        "model_version": 2,
+    }
     (root / "sizing_report_manifest.json").write_text(
-        json.dumps(
-            {
-                "report_pdf": report_path.as_posix(),
-                "font_family": GULLIVER_FONT_FAMILY,
-                "font_file": GULLIVER_FONT_PATH.as_posix(),
-                "model_version": 2,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-
-    print((root / "comparison_alpha_cases.json").as_posix())
+    print(comparison_path.as_posix())
     print(report_path.as_posix())
+
+
+if __name__ == "__main__":
+    main()

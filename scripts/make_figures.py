@@ -1,6 +1,4 @@
-"""Paper figures, generated from the Results/ summaries into Results/figures/
-(pdf + png, Gulliver font). See Results/figures/README.md for what each shows.
-"""
+"""Generate the paper figures from result summaries."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,21 +9,27 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from matplotlib.ticker import FuncFormatter, NullFormatter
 
 ROOT = Path(__file__).resolve().parents[1]
-RES = ROOT / "Results"
+SHARED = ROOT / "outputs"
+RES = SHARED / "sweeps" / "economic"
 OUT = RES / "figures"
 OUT.mkdir(parents=True, exist_ok=True)
 
-# -- Gulliver font (paper-wide standard) --
 _font_path = str(ROOT / "data" / "Gulliver.otf")
 font_manager.fontManager.addfont(_font_path)
 _prop = font_manager.FontProperties(fname=_font_path)
-plt.rcParams["font.family"] = "Gulliver"
-plt.rcParams["font.sans-serif"] = _prop.get_name()
-plt.rcParams["svg.fonttype"] = "none"
+_font_name = _prop.get_name()
+plt.rcParams.update({
+    "font.family": [_font_name, "DejaVu Sans"],
+    "mathtext.fontset": "dejavusans",
+    "axes.unicode_minus": False,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none",
+})
 
-# Consistent controller colors/markers across figures.
 CTRL = {
     "ideal": ("#111111", "o", "MPC (perfect forecast)"),
     "lstm": ("#1f77b4", "s", "MPC + LSTM"),
@@ -34,8 +38,12 @@ CTRL = {
     "stochastic": ("#d62728", "v", "Stochastic plan"),
 }
 
+PLAIN_LOG_TICKS = FuncFormatter(lambda value, _: f"{value:g}")
+
 
 def _save(fig, name: str) -> None:
+    for text in fig.findobj(matplotlib.text.Text):
+        text.set_text(text.get_text().replace("\N{MINUS SIGN}", "-"))
     for ext in ("pdf", "png"):
         fig.savefig(OUT / f"{name}.{ext}", bbox_inches="tight", dpi=200)
     plt.close(fig)
@@ -43,17 +51,9 @@ def _save(fig, name: str) -> None:
 
 
 def _mesh() -> pd.DataFrame:
-    df = pd.read_csv(RES / "5-mesh_sweep" / "summary.csv")
-    df["h"] = df["combo"].str.extract(r"h(\d+)_").astype(int)
-    df["t1"] = df["combo"].str.extract(r"t1_(\d+)").astype(int)
-    df["t2"] = df["combo"].str.extract(r"t2_(\d+)").astype(int)
-    return df
+    return pd.read_csv(RES / "01-mesh" / "summary.csv")
 
 
-# Month colors for the multi-season mesh figures. Labelled by PV condition
-# (verifiable from the data: Aug is the lowest-cost/PV-rich month, Feb the
-# highest-cost/PV-poor) rather than by hemisphere season, since the data
-# provenance is not established.
 SEASON = {
     "2009-05": ("#6a51a3", "May"),
     "2009-08": ("#e6550d", "Aug (PV-rich)"),
@@ -63,19 +63,13 @@ SEASON = {
 
 
 def _mesh_seasonal() -> pd.DataFrame:
-    """Full base-grid mesh across 4 seasons: May (5-mesh_sweep) + Aug/Nov/Feb."""
-    m = _mesh()
-    m = m[m["t2"].isin([30, 60, 120])].copy()
-    m["season"] = "2009-05"
-    s = pd.read_csv(RES / "7-seasonal" / "mesh" / "summary.csv")
-    cols = ["season", "controller_name", "combo", "h", "t1", "t2",
-            "operation_total_cost", "avg_solve_time_s"]
-    a = pd.concat([m[cols], s[cols]], ignore_index=True)
-    # Normalize cost to each season's minimum (absolute levels differ ~14x).
-    a["norm"] = a.groupby(["season", "controller_name"])["operation_total_cost"].transform(
-        lambda x: x / x.min()
+    df = pd.read_csv(RES / "02-seasonal-mesh" / "summary.csv")
+    df = df[df["t2"].isin([30, 60, 120])].copy()
+    df["season"] = df["month"]
+    df["norm"] = df.groupby(["season", "controller_name"])["operation_total_cost"].transform(
+        lambda values: values / values.min()
     )
-    return a
+    return df
 
 
 def fig_mesh_pareto() -> None:
@@ -83,14 +77,12 @@ def fig_mesh_pareto() -> None:
     p = df[df["controller_name"] == "prototype"].copy()
     fig, ax = plt.subplots(figsize=(6.8, 4.6))
 
-    # One colour per horizon.
-    hcolors = {6: "#d62728", 12: "#ff7f0e", 24: "#1f77b4", 36: "#2ca02c"}
+    hcolors = {12: "#ff7f0e", 24: "#1f77b4", 36: "#2ca02c"}
     for h, c in hcolors.items():
         d = p[p["h"] == h]
         ax.scatter(d["avg_solve_time_s"], d["operation_total_cost"],
                    s=55, c=c, alpha=0.8, label=f"h = {h} h", edgecolor="none")
 
-    # Pareto front (min cost at non-increasing solve time), on log-log.
     pp = p.sort_values("avg_solve_time_s")
     best, front = float("inf"), []
     for _, r in pp.iterrows():
@@ -101,8 +93,8 @@ def fig_mesh_pareto() -> None:
     ax.plot(fr["avg_solve_time_s"], fr["operation_total_cost"],
             "-", c="#333", lw=1.5, zorder=1, label="Pareto front")
 
-    knee = fr.loc[fr["operation_total_cost"].idxmin()]          # cheapest cost
-    cheap = fr.loc[fr["avg_solve_time_s"].idxmin()]             # cheapest solve
+    knee = fr.loc[fr["operation_total_cost"].idxmin()]
+    cheap = fr.loc[fr["avg_solve_time_s"].idxmin()]
     for r, dx, dy, ha in [(knee, 6, -2, "left"), (cheap, 8, 8, "left")]:
         ax.annotate(f"h{r['h']}/{r['t1']}/{r['t2']}",
                     (r["avg_solve_time_s"], r["operation_total_cost"]),
@@ -111,6 +103,10 @@ def fig_mesh_pareto() -> None:
 
     ax.set_xscale("log")
     ax.set_yscale("log")
+    ax.xaxis.set_major_formatter(PLAIN_LOG_TICKS)
+    ax.yaxis.set_major_formatter(PLAIN_LOG_TICKS)
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_minor_formatter(NullFormatter())
     ax.set_xlabel("avg solve time per step [s, log]  (lower better)")
     ax.set_ylabel("operating cost, 10 days [USD, log]  (lower better)")
     ax.grid(True, alpha=0.3, which="both")
@@ -119,11 +115,10 @@ def fig_mesh_pareto() -> None:
 
 
 def fig_mesh_methods() -> None:
-    """Cost heatmaps h x dt2 (dt1 = 10 min) side by side per forecaster."""
     df = _mesh()
     df = df[(df["t1"] == 10) & df["t2"].isin([30, 60, 120])]
     methods = [("ideal", "perfect forecast"), ("lstm", "LSTM"), ("prototype", "analog-day")]
-    hs = [6, 12, 24, 36]
+    hs = [12, 24, 36]
     t2s = [30, 60, 120]
 
     grids = {}
@@ -158,16 +153,12 @@ def fig_mesh_methods() -> None:
 
 
 def fig_mesh_cube() -> None:
-    """Full cube: rows = forecaster, cols = dt1; each panel a h x dt2 heatmap.
-
-    Shared log color scale (costs span 14 to ~700 USD across the cube).
-    """
     from matplotlib.colors import LogNorm
 
     df = _mesh()
     df = df[df["t2"].isin([30, 60, 120])]
     methods = [("ideal", "perfect forecast"), ("lstm", "LSTM"), ("prototype", "analog-day")]
-    hs = [6, 12, 24, 36]
+    hs = [12, 24, 36]
     t1s = [5, 10, 15]
     t2s = [30, 60, 120]
 
@@ -178,7 +169,6 @@ def fig_mesh_cube() -> None:
 
     from matplotlib.patches import Rectangle
 
-    # Three cheapest combos per forecaster, highlighted with a cell border.
     top3 = {}
     for key, _ in methods:
         d = df[df["controller_name"] == key].nsmallest(3, "operation_total_cost")
@@ -219,7 +209,6 @@ def fig_mesh_cube() -> None:
 
 
 def fig_dt2_seasonal() -> None:
-    """Normalized dt2 effect across 4 seasons (h=36), prototype and oracle."""
     a = _mesh_seasonal()
     fig, axes = plt.subplots(1, 2, figsize=(9.5, 4.2), sharey=True)
     for ax, ctrl, title in zip(
@@ -227,7 +216,6 @@ def fig_dt2_seasonal() -> None:
         ("MPC + analog-day forecast", "MPC + perfect forecast (oracle)"),
     ):
         d = a[(a["controller_name"] == ctrl) & (a["h"] == 36)]
-        # average over dt1 within each (season, dt2)
         g = d.groupby(["season", "t2"])["norm"].mean().reset_index()
         for season, (col, lbl) in SEASON.items():
             ds = g[g["season"] == season].sort_values("t2")
@@ -244,7 +232,6 @@ def fig_dt2_seasonal() -> None:
 
 
 def fig_horizon_seasonal() -> None:
-    """Horizon dominance across seasons (prototype, cost normalized per season)."""
     a = _mesh_seasonal()
     p = a[a["controller_name"] == "prototype"]
     g = p.groupby(["season", "h"])["norm"].mean().reset_index()
@@ -255,14 +242,13 @@ def fig_horizon_seasonal() -> None:
     ax.axhline(1.0, color="#999", ls=":", lw=1)
     ax.set_xlabel("prediction horizon $h$ [h]")
     ax.set_ylabel("cost / season minimum")
-    ax.set_xticks([6, 12, 24, 36])
+    ax.set_xticks([12, 24, 36])
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False, fontsize=8, title="season", title_fontsize=8)
     _save(fig, "fig_horizon_seasonal")
 
 
 def fig_pareto_seasonal() -> None:
-    """Cost (normalized) vs solve time, per season, with the shared Pareto shape."""
     a = _mesh_seasonal()
     p = a[a["controller_name"] == "prototype"]
     fig, ax = plt.subplots(figsize=(6.8, 4.4))
@@ -277,6 +263,7 @@ def fig_pareto_seasonal() -> None:
         fr = pd.DataFrame(front)
         ax.plot(fr["avg_solve_time_s"], fr["norm"], "-o", c=col, lw=1.8, ms=5, label=lbl)
     ax.set_xscale("log")
+    ax.xaxis.set_major_formatter(PLAIN_LOG_TICKS)
     ax.set_xlabel("avg solve time per step [s, log]  (lower better)")
     ax.set_ylabel("cost / season minimum  (lower better)")
     ax.grid(True, alpha=0.3, which="both")
@@ -285,8 +272,8 @@ def fig_pareto_seasonal() -> None:
 
 
 def _monthly() -> pd.DataFrame:
-    s = pd.read_csv(RES / "7-seasonal" / "summary.csv")
-    s["ctrl"] = s["forecaster"].fillna("stochastic")
+    s = pd.read_csv(RES / "03-forecast-operation" / "summary.csv")
+    s["ctrl"] = s["forecaster"]
     piv = s.pivot_table(index="month", columns="ctrl",
                         values="operation_total_cost", aggfunc="first")
     return piv.sort_index()
@@ -316,28 +303,28 @@ def fig_evpi_monthly() -> None:
 
 def fig_stochastic_tail() -> None:
     piv = _monthly()
-    seeds = pd.read_csv(RES / "6-robustness" / "summary.csv")
+    seeds = pd.read_csv(RES / "05-robustness" / "summary.csv")
     seeds = seeds[seeds["variant"].str.startswith("seed")]
     seed_stoch = seeds[seeds["controller"] == "stochastic"]["operation_total_cost"].values
     seed_mpc = seeds[seeds["controller"] == "mpc"]["operation_total_cost"].values
 
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
-    data = [piv["prototype-prefix"].values, seed_mpc,
-            piv["stochastic"].values, seed_stoch]
-    labels = ["MPC\n(12 months)", "MPC\n(10 seeds)",
-              "Stochastic\n(12 months)", "Stochastic\n(10 seeds)"]
-    bp = ax.boxplot(data, labels=labels, showfliers=True, widths=0.6, patch_artist=True)
-    for patch, col in zip(bp["boxes"], ["#2ca02c", "#2ca02c", "#d62728", "#d62728"]):
+    data = [piv["prototype-prefix"].values, seed_mpc, seed_stoch]
+    labels = ["MPC\n(12 months)", "MPC\n(seed variants)",
+              "Stochastic\n(seed variants)"]
+    bp = ax.boxplot(data, tick_labels=labels, showfliers=True, widths=0.6, patch_artist=True)
+    for patch, col in zip(bp["boxes"], ["#2ca02c", "#2ca02c", "#d62728"]):
         patch.set_facecolor(col)
         patch.set_alpha(0.35)
     ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(PLAIN_LOG_TICKS)
     ax.set_ylabel("operating cost, 10 days [USD, log]")
     ax.grid(True, alpha=0.3, axis="y")
     _save(fig, "fig_stochastic_tail")
 
 
 def fig_recourse() -> None:
-    r = pd.read_csv(RES / "10-recourse" / "summary.csv")
+    r = pd.read_csv(RES / "04-recourse" / "summary.csv")
     piv = r.pivot_table(index="window", columns="resolve_every_h",
                         values="operation_total_cost")
     piv = piv[sorted(piv.columns)]
@@ -345,6 +332,7 @@ def fig_recourse() -> None:
     for w in piv.index:
         ax.plot(piv.columns, piv.loc[w], "-o", lw=1.6, ms=5, label=w)
     ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(PLAIN_LOG_TICKS)
     ax.set_xlabel("re-solve interval [h]  (smaller = more feedback)")
     ax.set_ylabel("stochastic cost, 10 days [USD, log]")
     ax.grid(True, alpha=0.3)
@@ -352,7 +340,7 @@ def fig_recourse() -> None:
     _save(fig, "fig_recourse")
 
 
-if __name__ == "__main__":
+def main() -> None:
     fig_mesh_pareto()
     fig_mesh_methods()
     fig_mesh_cube()
@@ -362,4 +350,8 @@ if __name__ == "__main__":
     fig_evpi_monthly()
     fig_stochastic_tail()
     fig_recourse()
-    print(f"\n7 figures written to {OUT.as_posix()}")
+    print(f"\n9 figures written to {OUT.as_posix()}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,4 @@
-"""Paper tables (booktabs), generated from the Results/ summaries into
-Results/figures/tables.tex.
-"""
+"""Generate the paper's booktabs tables from result summaries."""
 from __future__ import annotations
 
 import json
@@ -10,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-RES = ROOT / "Results"
+SHARED = ROOT / "outputs"
+RES = SHARED / "sweeps" / "economic"
 OUT = RES / "figures"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -26,9 +25,11 @@ def latex_table(caption: str, label: str, colspec: str,
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------
 def t1_forecast() -> str:
-    s = json.load(open(RES / "forecasting" / "prototype_eval_summary.json", encoding="utf-8"))
+    s = json.load(open(
+        SHARED / "forecasting-causal-v2" / "prototype_eval_summary.json",
+        encoding="utf-8",
+    ))
     mae = s["load_mae_5min_by_method"]
     skill = s["load_skill_vs_seasonal_60min"]
     order = ["lstm", "prototype-calendar", "prototype-prefix", "prototype-knn",
@@ -50,20 +51,14 @@ def t1_forecast() -> str:
         [r"Forecaster & MAE [kW] & Skill vs.\ naive \\"], rows)
 
 
-# --------------------------------------------------------------------------
 def t2_controllers() -> str:
-    df = pd.read_csv(RES / "3-forecaster_comparison" / "summary.csv")
-    cost = {}
-    for _, r in df.iterrows():
-        name = r["forecaster"] if isinstance(r["forecaster"], str) else "stochastic"
-        cost[name] = float(r["operation_total_cost"])
+    df = pd.read_csv(RES / "03-forecast-operation" / "summary.csv")
+    df = df[df["month"] == "2009-05"]
+    cost = df.set_index("forecaster")["operation_total_cost"].to_dict()
     ideal = cost["ideal"]
     order = [("ideal", "MPC, perfect forecast (oracle)"),
              ("lstm", "MPC + LSTM"),
-             ("prototype-prefix", "MPC + analog-day (prefix)"),
-             ("prototype-calendar", "MPC + analog-day (calendar)"),
-             ("hybrid", "MPC + hybrid"),
-             ("stochastic", "Stochastic plan (receding)")]
+             ("prototype-prefix", "MPC + analog-day (prefix)")]
     rows = []
     for key, lbl in order:
         if key not in cost:
@@ -73,19 +68,17 @@ def t2_controllers() -> str:
         rows.append([lbl, f"{c:.1f}", ratio])
     return latex_table(
         r"Closed-loop operating cost over a 10-day window (May), same outage calendar. "
-        r"Ratio is relative to the perfect-forecast oracle; the oracle--LSTM ratio is the EVPI, "
-        r"the analog--stochastic ratio the value of the stochastic solution.",
+        r"Ratio is relative to the perfect-forecast oracle; the oracle--LSTM gap is the EVPI.",
         "tab:controllers", "lcc",
         [r"Controller & Cost [USD] & vs.\ oracle \\"], rows)
 
 
-# --------------------------------------------------------------------------
 def t3_monthly() -> str:
-    s = pd.read_csv(RES / "7-seasonal" / "summary.csv")
-    s["ctrl"] = s["forecaster"].fillna("stochastic")
+    s = pd.read_csv(RES / "03-forecast-operation" / "summary.csv")
+    s["ctrl"] = s["forecaster"]
     piv = s.pivot_table(index="month", columns="ctrl",
                         values="operation_total_cost", aggfunc="first").sort_index()
-    cols = ["ideal", "lstm", "prototype-prefix", "stochastic"]
+    cols = ["ideal", "lstm", "prototype-prefix"]
     rows = []
     for month in piv.index:
         r = piv.loc[month]
@@ -94,22 +87,18 @@ def t3_monthly() -> str:
     rows.append([r"\textbf{Annual}"] + [f"\\textbf{{{tot[c]:.0f}}}" for c in cols])
     return latex_table(
         r"Operating cost [USD] by controller across twelve monthly 10-day windows (120 days). "
-        r"Last row is the annual aggregate; the oracle--LSTM ratio there is the yearly EVPI.",
-        "tab:monthly", "lcccc",
-        [r"Window & Oracle & LSTM & Analog & Stochastic \\"], rows)
+        r"The last row is the 120-day aggregate.",
+        "tab:monthly", "lccc",
+        [r"Window & Oracle & LSTM & Analog \\"], rows)
 
 
-# --------------------------------------------------------------------------
 def t4_mesh() -> str:
-    df = pd.read_csv(RES / "5-mesh_sweep" / "summary.csv")
+    df = pd.read_csv(RES / "01-mesh" / "summary.csv")
     df = df[df["controller_name"] == "prototype"].copy()
-    df["h"] = df["combo"].str.extract(r"h(\d+)_").astype(int)
-    df["t1"] = df["combo"].str.extract(r"t1_(\d+)").astype(int)
-    df["t2"] = df["combo"].str.extract(r"t2_(\d+)").astype(int)
-    picks = ["h36_t1_10_t2_60", "h36_t1_15_t2_120", "h6_t1_15_t2_120"]
-    note = {"h36_t1_10_t2_60": "min-cost (champion)",
-            "h36_t1_15_t2_120": "embedded (0.7 s)",
-            "h6_t1_15_t2_120": "short-horizon"}
+    picks = ["h12_t1_5_t2_30", "h12_t1_15_t2_120", "h36_t1_5_t2_30"]
+    note = {"h12_t1_5_t2_30": "selected mesh",
+            "h12_t1_15_t2_120": "fastest solve",
+            "h36_t1_5_t2_30": "long horizon"}
     rows = []
     for c in picks:
         r = df[df["combo"] == c].iloc[0]
@@ -124,52 +113,44 @@ def t4_mesh() -> str:
         rows)
 
 
-# --------------------------------------------------------------------------
 def t5_robustness() -> str:
-    s = pd.read_csv(RES / "6-robustness" / "summary.csv")
+    s = pd.read_csv(RES / "05-robustness" / "summary.csv")
     piv = s.pivot_table(index="variant", columns="controller",
-                        values="operation_total_cost", aggfunc="first")
+                        values="operation_total_cost", aggfunc="mean")
 
     rows = []
-    # Actuator noise levels
-    for v in ["noise_0.02", "noise_0.05", "noise_0.10"]:
+    for v in ["noise_005", "noise_010"]:
         if v in piv.index:
-            std = v.split("_")[1]
+            std = f"0.{v.split('_')[1]}"
             rows.append([f"Actuator noise $\\sigma={std}$",
                          f"{piv.loc[v, 'mpc']:.1f}", f"{piv.loc[v, 'stochastic']:.0f}"])
-    # Outage probability
-    for v in ["outage_2pct", "outage_5pct", "outage_10pct"]:
+    for v in ["outage_2pct", "outage_5pct"]:
         if v in piv.index:
             pct = v.replace("outage_", "").replace("pct", "")
             rows.append([f"Outage prob.\\ {pct}\\%/day",
                          f"{piv.loc[v, 'mpc']:.1f}", f"{piv.loc[v, 'stochastic']:.0f}"])
-    # Outage seeds: mean +/- std and max
     seeds = piv[piv.index.str.startswith("seed")]
     smpc = seeds["mpc"]
     sst = seeds["stochastic"]
-    rows.append([r"\midrule 10 outage seeds (mean\,$\pm$\,sd)",
+    rows.append([r"\midrule Outage seeds (mean\,$\pm$\,sd)",
                  f"{smpc.mean():.1f}$\\pm${smpc.std():.1f}",
                  f"{sst.mean():.0f}$\\pm${sst.std():.0f}"])
-    rows.append([r"10 outage seeds (max)", f"{smpc.max():.1f}", f"{sst.max():.0f}"])
+    rows.append([r"Outage seeds (max)", f"{smpc.max():.1f}", f"{sst.max():.0f}"])
     return latex_table(
-        r"Robustness of closed-loop MPC vs.\ the receding stochastic plan (10-day window). "
-        r"The MPC cost is near-invariant; the open-loop stochastic plan exhibits a heavy tail.",
+        r"Robustness of closed-loop MPC vs.\ the receding stochastic plan. "
+        r"Reported values are averaged over the available validation windows.",
         "tab:robustness", "lcc",
         [r"Variant & MPC [USD] & Stochastic [USD] \\"], rows)
 
 
 def t6_mesh_full() -> str:
-    """Full mesh cube: method x h x dt1 x dt2 operating cost (May window)."""
-    df = pd.read_csv(RES / "5-mesh_sweep" / "summary.csv")
-    df["h"] = df["combo"].str.extract(r"h(\d+)_").astype(int)
-    df["t1"] = df["combo"].str.extract(r"t1_(\d+)").astype(int)
-    df["t2"] = df["combo"].str.extract(r"t2_(\d+)").astype(int)
+    df = pd.read_csv(RES / "01-mesh" / "summary.csv")
     df = df[df["t2"].isin([30, 60, 120])]
     methods = [("ideal", "Perfect forecast"), ("lstm", "LSTM"), ("prototype", "Analog-day")]
     t2s = [30, 60, 120]
 
     cost = {}
-    rank = {}  # (method, h, t1, t2) -> 1..3 for each method's three cheapest combos
+    rank = {}
     for key, _ in methods:
         d = df[df["controller_name"] == key]
         for _, r in d.iterrows():
@@ -178,7 +159,7 @@ def t6_mesh_full() -> str:
             rank[(key, r["h"], r["t1"], r["t2"])] = pos
 
     rows = []
-    for h in [6, 12, 24, 36]:
+    for h in [12, 24, 36]:
         for i, t1 in enumerate([5, 10, 15]):
             cells = [str(h) if i == 0 else "", str(t1)]
             for key, _ in methods:
@@ -207,7 +188,7 @@ def t6_mesh_full() -> str:
         header, rows)
 
 
-if __name__ == "__main__":
+def main() -> None:
     parts = [
         "% Generated by scripts/make_tables.py.",
         "% Requires \\usepackage{booktabs} in the paper preamble.",
@@ -217,3 +198,7 @@ if __name__ == "__main__":
     ]
     (OUT / "tables.tex").write_text("\n".join(parts), encoding="utf-8")
     print(f"[tables] 6 tables written to {(OUT / 'tables.tex').as_posix()}")
+
+
+if __name__ == "__main__":
+    main()

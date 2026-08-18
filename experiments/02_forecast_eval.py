@@ -1,7 +1,4 @@
-"""Offline forecast evaluation on the system produced by 01_sizing.py.
-
-Outputs go to Results/forecasting-causal-v2/. Run from the repo root.
-"""
+"""Evaluate the forecasting models offline."""
 
 import sys
 from pathlib import Path
@@ -15,6 +12,10 @@ DAYS = 365
 EVERY_MIN = 60
 WITH_LSTM = True
 
-if __name__ == "__main__":
+def main() -> None:
     params = load_sized_parameters()
     run_evaluation(days=DAYS, every_min=EVERY_MIN, with_lstm=WITH_LSTM, params=params)
+
+
+if __name__ == "__main__":
+    main()

@@ -49,8 +49,8 @@ Ou encadear vários em sequência:
 python experiments/01_sizing.py; python experiments/02_forecast_eval.py
 ```
 
-Não pule o experimento 01: a avaliação de previsão e o pipeline 12 exigem o
-artefato `Results/sizing/alpha_gt_0` com fechamento cíclico auditado.
+O artefato econômico auditado e com fechamento cíclico está versionado em
+`paper/sizing/economic/degradation/`; rode o experimento 01 somente para refazê-lo.
 
 ## 6. Soltar a sessão (deixar rodando) e fechar o navegador
 

@@ -1,16 +1,4 @@
-# -*- coding: utf-8 -*-
-# File: forecasting/evaluate_prototype.py
-"""Offline forecast evaluation on the test series.
-
-Each method produces a 36h forecast on a 5-min grid at every origin; errors
-are bucketed by lead time (5-min and 60-min block resolutions) with skill
-vs the seasonal-naive baseline. Resumable: per-origin partial sums go to
-prototype_eval_checkpoint.csv and finished origins are skipped on restart.
-The checkpoint is guarded by an explicit evaluation manifest. Outputs land
-in Results/forecasting-causal-v2/.
-
-Entry point: run_evaluation() — see experiments/02_forecast_eval.py.
-"""
+"""Resumable offline evaluation of the causal forecasting methods."""
 
 from __future__ import annotations
 
@@ -44,14 +32,14 @@ except ImportError:  # pragma: no cover
 LOAD_CSV = "data/load_5min_test.csv"
 PV_CSV = "data/pv_5min_test.csv"
 PARAMS_JSON = "data/parameters.json"
-OUT_DIR = Path("Results/forecasting-causal-v2")
+OUT_DIR = Path("outputs/forecasting-causal-v2")
 FORECAST_EVALUATION_VERSION = "causal-forecast-evaluation-v2"
 
 LEAD_BUCKETS_H = [(0, 1), (1, 6), (6, 12), (12, 24), (24, 36)]
 HORIZON_MIN = 36 * 60
 STEP_MIN = 5
 N_STEPS = HORIZON_MIN // STEP_MIN
-CHECKPOINT_EVERY = 100  # flush partial results to disk every N origins
+CHECKPOINT_EVERY = 100
 
 
 def _evaluation_manifest(
@@ -62,7 +50,6 @@ def _evaluation_manifest(
     start: str | None,
     with_lstm: bool,
 ) -> dict:
-    """Identity of every setting that makes a checkpoint reusable."""
     return {
         "forecast_evaluation_version": FORECAST_EVALUATION_VERSION,
         "forecast_assembly_version": FORECAST_ASSEMBLY_VERSION,
@@ -83,7 +70,7 @@ def _forecast_to_array(fc_dict: dict) -> np.ndarray:
 
 
 def _seasonal_naive(s: pd.Series, t0: pd.Timestamp) -> np.ndarray:
-    """forecast(t0 + l) = actual(t0 - 24h + (l mod 24h)) — causal cyclic repeat of yesterday."""
+    """Repeat yesterday's observations cyclically without using future data."""
     out = np.empty(N_STEPS)
     for i in range(N_STEPS):
         lead = (i * STEP_MIN) % (24 * 60)
@@ -102,11 +89,7 @@ def _actuals(s: pd.Series, t0: pd.Timestamp) -> np.ndarray:
 
 
 def _bucketize_origin(err_rows: list[dict], origin: pd.Timestamp) -> list[dict]:
-    """Collapse one origin's per-lead errors into per-bucket partial sums.
-
-    Returns additive aggregates (n, sum_abs, sum_sq) tagged with the origin so
-    they can be appended to the checkpoint and later summed across origins.
-    """
+    """Collapse one origin's errors into additive bucket statistics."""
     if not err_rows:
         return []
     df = pd.DataFrame(err_rows)
@@ -132,7 +115,7 @@ def _bucketize_origin(err_rows: list[dict], origin: pd.Timestamp) -> list[dict]:
 
 
 def _finalize_metrics(df_ckpt: pd.DataFrame) -> pd.DataFrame:
-    """Combine checkpoint partial sums (across origins) into MAE/RMSE/skill."""
+    """Combine checkpoint partial sums into MAE, RMSE and skill."""
     out = df_ckpt.groupby(
         ["method", "target", "resolution", "lead_bucket_h"], as_index=False
     ).agg(n=("n", "sum"), sum_abs=("sum_abs", "sum"), sum_sq=("sum_sq", "sum"))
@@ -148,8 +131,8 @@ def _finalize_metrics(df_ckpt: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _accumulate_errors(rows: list, method: str, target: str,
-                       y_hat: np.ndarray, y_true: np.ndarray) -> None:
+def _accumulate_errors(rows: list, method: str, target: str, y_hat: np.ndarray,
+                       y_true: np.ndarray) -> None:
     lead_h = (np.arange(N_STEPS) + 1) * STEP_MIN / 60.0
     ok = ~(np.isnan(y_hat) | np.isnan(y_true))
     err = y_hat[ok] - y_true[ok]
@@ -158,7 +141,6 @@ def _accumulate_errors(rows: list, method: str, target: str,
             {"method": method, "target": target, "resolution": "5min",
              "lead_h": float(lh), "abs_err": abs(float(e)), "sq_err": float(e) ** 2}
         )
-    # 60-min block means (12 x 5-min steps per block)
     n_blocks = N_STEPS // 12
     yh = y_hat[: n_blocks * 12].reshape(n_blocks, 12)
     yt = y_true[: n_blocks * 12].reshape(n_blocks, 12)
@@ -174,8 +156,8 @@ def _accumulate_errors(rows: list, method: str, target: str,
         )
 
 
-def _classification_accuracy(fc: PrototypeForecast, s: pd.Series, scale: float,
-                             protos: dict, kind: str, days: list) -> pd.DataFrame:
+def _classification_accuracy(fc: PrototypeForecast, s: pd.Series, scale: float, protos: dict,
+                             kind: str, days: list) -> pd.DataFrame:
     """Prefix-classification accuracy by hour of day vs full-day nearest prototype."""
     recs = []
     for day in days:
@@ -206,19 +188,14 @@ def run_evaluation(
     out_dir=OUT_DIR,
     params: dict | None = None,
 ) -> None:
-    """Evaluate prototype/naive (and optionally LSTM) forecasts over the test series.
-
-    days      : evaluation window length in days
-    every_min : spacing between forecast origins
-    start     : first forecast origin (default: data start + 24h)
-    with_lstm : also evaluate ForecastMPC (loads TensorFlow)
-    """
+    """Evaluate prototype, naive and optionally LSTM forecasts."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     params = params if params is not None else load_sized_parameters(PARAMS_JSON)
     used_path = out_dir / 'parameters_used.json'
-    ckpt_path = out_dir / 'prototype_eval_checkpoint.csv'
+    ckpt_path = out_dir / 'prototype_eval_checkpoint.parquet'
+    partial_path = out_dir / 'prototype_eval_checkpoint.partial.csv'
     manifest_path = out_dir / 'evaluation_manifest.json'
     run_manifest = _evaluation_manifest(
         params,
@@ -227,11 +204,12 @@ def run_evaluation(
         start=start,
         with_lstm=with_lstm,
     )
-    if ckpt_path.exists() and not manifest_path.exists():
+    checkpoint_exists = ckpt_path.exists() or partial_path.exists()
+    if checkpoint_exists and not manifest_path.exists():
         raise RuntimeError(
             'Forecast checkpoint has no evaluation manifest; use a fresh output directory.'
         )
-    if manifest_path.exists() and ckpt_path.exists():
+    if manifest_path.exists() and checkpoint_exists:
         previous = json.loads(manifest_path.read_text(encoding='utf-8'))
         if previous != run_manifest:
             changed = sorted(
@@ -272,12 +250,15 @@ def run_evaluation(
 
         lstm = ForecastMPC({}, load_s, pv_s, pv_scale, load_scale)
 
-    # Resumable checkpoint: per-origin bucket partial sums appended to disk so
-    # an interrupted run (crash, instance stop) resumes instead of restarting.
     done_origins: set[str] = set()
     if ckpt_path.exists():
-        done_origins = set(pd.read_csv(ckpt_path, usecols=["origin"])["origin"].astype(str))
+        done_origins = set(pd.read_parquet(ckpt_path, columns=["origin"])["origin"].astype(str))
         print(f"[eval] resuming from checkpoint: {len(done_origins)} origins already done")
+    if partial_path.exists():
+        done_origins.update(
+            pd.read_csv(partial_path, usecols=["origin"])["origin"].astype(str)
+        )
+        print(f"[eval] resuming from partial checkpoint: {len(done_origins)} origins already done")
 
     buffer: list[dict] = []
 
@@ -285,7 +266,7 @@ def run_evaluation(
         if not buffer:
             return
         pd.DataFrame(buffer).to_csv(
-            ckpt_path, mode="a", header=not ckpt_path.exists(), index=False
+            partial_path, mode="a", header=not partial_path.exists(), index=False
         )
         buffer.clear()
 
@@ -325,16 +306,24 @@ def run_evaluation(
             print(f"[eval] {k + 1}/{len(origins)} origins done (checkpointed)")
     _flush()
 
+    if partial_path.exists():
+        partial = pd.read_csv(partial_path)
+        checkpoint = pd.read_parquet(ckpt_path) if ckpt_path.exists() else pd.DataFrame()
+        checkpoint = pd.concat([checkpoint, partial], ignore_index=True)
+        checkpoint.to_parquet(
+            ckpt_path, engine="pyarrow", compression="zstd", index=False,
+        )
+        partial_path.unlink()
+
     if not ckpt_path.exists():
         print("[eval] no origins evaluated; nothing to finalize.")
         return
 
-    metrics = _finalize_metrics(pd.read_csv(ckpt_path))
+    metrics = _finalize_metrics(pd.read_parquet(ckpt_path))
     metrics_csv = out_dir / "prototype_eval_metrics.csv"
     metrics.to_csv(metrics_csv, index=False)
     print(f"[eval] metrics saved: {metrics_csv.as_posix()}")
 
-    # Cluster-classification accuracy by hour (prefix strategy)
     fc_prefix = forecasters["prototype-prefix"]
     eval_days = sorted({ts.normalize() for ts in origins})
     acc_load = _classification_accuracy(

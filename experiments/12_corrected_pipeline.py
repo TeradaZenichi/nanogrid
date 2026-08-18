@@ -1,14 +1,10 @@
-"""Corrected and resumable operational campaign.
-
-The pipeline preserves legacy artifacts and writes every new result under
-``Results`` by default. Its default stage is a short smoke test; use
-``--stage all`` only when the machine is ready for the complete campaign.
-"""
+"""Run the corrected and resumable operational campaign."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -24,6 +20,8 @@ sys.path.insert(0, str(ROOT))
 from forecasting import PerfectForecast, PrototypeForecast
 from forecasting.causal import FORECAST_ASSEMBLY_VERSION
 from opt import simulate_mpc, simulate_stochastic
+from opt.artifacts import operation_artifact_path, read_operation
+from opt.campaigns import sha256_file
 from opt.operation import (
     COST_ACCOUNTING_VERSION,
     OPERATION_MODEL_VERSION,
@@ -31,23 +29,29 @@ from opt.operation import (
     parameter_fingerprint,
     validate_time_mesh,
 )
-from opt.utils import load_series_scaled, load_sized_parameters
+from opt.utils import (
+    load_series_scaled,
+    load_sized_parameters,
+    load_sized_parameters_from_artifact,
+)
 
 
 PARAMS_JSON = "data/parameters.json"
 LOAD_CSV = "data/load_5min_test.csv"
 PV_CSV = "data/pv_5min_test.csv"
-DEFAULT_OUT_ROOT = Path("Results")
-DEFAULT_N_ITERS = 2880  # 10 days at 5 min
+DEFAULT_OUT_ROOT = Path("outputs") / "sweeps" / "economic"
+DEFAULT_SMOKE_ROOT = Path("outputs") / "_smoke-pipeline"
+DEFAULT_N_ITERS = 2880
+PARAMETERS_ENV = "NANOGRID_OPERATION_PARAMETERS"
+SIZING_ARTIFACT_ENV = "NANOGRID_OPERATION_SIZING_ARTIFACT"
+CAMPAIGN_ID_ENV = "NANOGRID_OPERATION_CAMPAIGN_ID"
 
 MESH_H = (12, 24, 36)
 MESH_T1 = (5, 10, 15)
 MESH_T2 = (30, 60, 120)
 EVALUATION_CONTROLLERS = ("ideal", "prototype", "lstm")
 SELECTION_CONTROLLERS = ("prototype", "lstm")
-# Compatibility alias for external analysis code. Selection never uses this
-# alias: ideal is a perfect-information target, not an implementable controller.
-MESH_CONTROLLERS = EVALUATION_CONTROLLERS
+MESH_CONTROLLERS = EVALUATION_CONTROLLERS  # Backward-compatible public alias.
 MESH_SELECTION_VERSION = "operational-forecaster-regret-annual-wear-v5"
 MESH_SELECTION_WEIGHTS = {
     "mean_regret": 0.4,
@@ -64,13 +68,9 @@ MONTHS = (
     "2009-05", "2009-06", "2009-07", "2009-08", "2009-09", "2009-10",
     "2009-11", "2009-12", "2010-01", "2010-02", "2010-03", "2010-04",
 )
-MONTHLY_VALIDATION_WINDOWS = {
-    month: f"{month}-01 00:00:00" for month in MONTHS
-}
+MONTHLY_VALIDATION_WINDOWS = {month: f"{month}-01 00:00:00" for month in MONTHS}
 BASE_OUTAGE_SEED = 42
-MONTHLY_OUTAGE_SEEDS = {
-    month: BASE_OUTAGE_SEED + index for index, month in enumerate(MONTHS)
-}
+MONTHLY_OUTAGE_SEEDS = {month: BASE_OUTAGE_SEED + i for i, month in enumerate(MONTHS)}
 RECOURSE_WINDOWS = (
     ("may_seed42", "2009-05-01 00:00:00", 42),
     ("may_seed44", "2009-05-01 00:00:00", 44),
@@ -98,8 +98,18 @@ def _mesh_tag(h: int, t1: int, t2: int) -> str:
     return f"h{h}_t1_{t1}_t2_{t2}"
 
 
-def _base_params(mesh: dict[str, int], seed: int | None = None) -> dict:
-    params = load_sized_parameters(PARAMS_JSON)
+def _base_params(
+    mesh: dict[str, int],
+    seed: int | None = None,
+    parameters_json: str | Path | None = None,
+    sizing_artifact: str | Path | None = None,
+) -> dict:
+    parameters_json = parameters_json or os.environ.get(PARAMETERS_ENV, PARAMS_JSON)
+    sizing_artifact = sizing_artifact or os.environ.get(SIZING_ARTIFACT_ENV)
+    if sizing_artifact:
+        params = load_sized_parameters_from_artifact(parameters_json, sizing_artifact)
+    else:
+        params = load_sized_parameters(str(parameters_json))
     params["time"].update(
         horizon_hours=int(mesh["h"]),
         timestep_1_min=int(mesh["t1"]),
@@ -120,33 +130,23 @@ def _forecaster(name: str, params: dict):
     if name == "ideal":
         return PerfectForecast(load_s, pv_s), "ideal"
     if name == "prototype":
-        return (
-            PrototypeForecast(
-                None,
-                load_s,
-                pv_s,
-                float(params["PV"]["Pmax_kw"]),
-                float(params["Load"]["Pmax_kw"]),
-                strategy="prefix",
-            ),
-            "prototype-prefix",
+        forecast = PrototypeForecast(
+            None, load_s, pv_s, float(params["PV"]["Pmax_kw"]),
+            float(params["Load"]["Pmax_kw"]), strategy="prefix",
         )
+        return forecast, "prototype-prefix"
     if name == "lstm":
         from forecasting.get_forecasting import ForecastMPC
 
-        return (
-            ForecastMPC(
-                {}, load_s, pv_s,
-                float(params["PV"]["Pmax_kw"]),
-                float(params["Load"]["Pmax_kw"]),
-            ),
-            "lstm",
+        forecast = ForecastMPC(
+            {}, load_s, pv_s, float(params["PV"]["Pmax_kw"]),
+            float(params["Load"]["Pmax_kw"]),
         )
+        return forecast, "lstm"
     raise ValueError(f"Unknown controller: {name}")
 
 
 def _audit_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Return strict numerical and physical audit fields for one case."""
     reasons: list[str] = []
 
     def value(name: str) -> float:
@@ -159,10 +159,8 @@ def _audit_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     if solver_failures:
         reasons.append(f"{solver_failures} solver failure(s)")
 
-    overlap = max(
-        value("max_simultaneous_ch_dis_kw"),
-        value("max_plant_simultaneous_ch_dis_kw"),
-    )
+    overlap = max(value("max_simultaneous_ch_dis_kw"),
+                  value("max_plant_simultaneous_ch_dis_kw"))
     if overlap > 1e-6:
         reasons.append(f"charge/discharge overlap {overlap:.12g} kW")
 
@@ -183,24 +181,20 @@ def _audit_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "audit_solver_failures": solver_failures,
         "audit_reasons": " | ".join(reasons),
         "audit_max_simultaneous_ch_dis_kw": overlap,
-        "audit_max_abs_power_balance_residual_kw": value(
-            "max_abs_power_balance_residual_kw"
-        ),
-        "audit_max_grid_exchange_during_outage_kw": value(
-            "max_grid_exchange_during_outage_kw"
-        ),
-        "audit_max_bess_energy_bound_violation_kwh": value(
-            "max_bess_energy_bound_violation_kwh"
-        ),
-        "audit_max_bess_energy_transition_residual_kwh": value(
-            "max_bess_energy_transition_residual_kwh"
-        ),
+        "audit_max_abs_power_balance_residual_kw": value("max_abs_power_balance_residual_kw"),
+        "audit_max_grid_exchange_during_outage_kw": value("max_grid_exchange_during_outage_kw"),
+        "audit_max_bess_energy_bound_violation_kwh": value("max_bess_energy_bound_violation_kwh"),
+        "audit_max_bess_energy_transition_residual_kwh": value("max_bess_energy_transition_residual_kwh"),
     }
 
 
 def execute_task(task: dict[str, Any]) -> dict[str, Any]:
-    """Picklable worker for MPC and stochastic campaign cases."""
-    params = _base_params(task["mesh"], seed=task.get("seed"))
+    params = _base_params(
+        task["mesh"],
+        seed=task.get("seed"),
+        parameters_json=task.get("parameters_json"),
+        sizing_artifact=task.get("sizing_artifact"),
+    )
     for section, values in task.get("overrides", {}).items():
         params[section].update(values)
     validate_time_mesh(params)
@@ -211,10 +205,7 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
     n_iters = int(task["n_iters"])
     if controller == "stochastic":
         metrics = simulate_stochastic(
-            params,
-            start,
-            n_iters,
-            out_dir,
+            params, start, n_iters, out_dir,
             resolve_every_h=float(task.get("resolve_every_h", 24.0)),
             resume=bool(task.get("resume", True)),
         )
@@ -222,11 +213,7 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
     else:
         forecast, forecast_name = _forecaster(controller, params)
         metrics = simulate_mpc(
-            params,
-            forecast,
-            start,
-            n_iters,
-            out_dir,
+            params, forecast, start, n_iters, out_dir,
             forecaster_name=forecast_name,
             resume=bool(task.get("resume", True)),
         )
@@ -241,36 +228,89 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
         t1=int(task["mesh"]["t1"]),
         t2=int(task["mesh"]["t2"]),
         combo=_mesh_tag(**task["mesh"]),
+        campaign_id=str(task.get("campaign_id", "economic")),
+        sizing_case=str(params["sizing_case_applied"]["case"]),
+        sizing_source_sha256=str(params["sizing_case_applied"]["source_sha256"]),
     )
     metrics.update(task.get("labels", {}))
     metrics.update(_audit_metrics(metrics))
     return metrics
 
 
-def _write_progress(path: Path, stage: str, completed: int, total: int, started: float) -> None:
+def _write_progress(
+    path: Path,
+    stage: str,
+    completed: int,
+    total: int,
+    started: float,
+    recovered_rows: int = 0,
+) -> None:
     elapsed = time.perf_counter() - started
     eta = (elapsed / completed) * (total - completed) if completed else None
     payload = {
         "stage": stage,
         "completed": completed,
         "total": total,
+        "recovered_summary_rows": int(recovered_rows),
         "elapsed_s": elapsed,
         "eta_s": eta,
         "operation_model_version": OPERATION_MODEL_VERSION,
         "updated_at": pd.Timestamp.now().isoformat(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    pd.DataFrame(rows).to_csv(temporary, index=False)
+    os.replace(temporary, path)
+
+
+def _existing_summary_rows(path: Path, case_ids: set[str]) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        summary = pd.read_csv(path)
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return []
+    if "case_id" not in summary.columns:
+        return []
+    summary["case_id"] = summary["case_id"].astype(str)
+    summary = summary[summary["case_id"].isin(case_ids)]
+    summary = summary.drop_duplicates(subset="case_id", keep="last")
+    return summary.to_dict(orient="records")
 
 
 def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> pd.DataFrame:
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     stage = str(tasks[0]["stage"]) if tasks else summary_path.stem
     state_path = summary_path.parent / "pipeline_state.json"
-    rows: list[dict[str, Any]] = []
     started = time.perf_counter()
+    context = {
+        "parameters_json": os.environ.get(PARAMETERS_ENV, PARAMS_JSON),
+        "sizing_artifact": os.environ.get(SIZING_ARTIFACT_ENV),
+        "campaign_id": os.environ.get(CAMPAIGN_ID_ENV, "economic"),
+    }
+    for task in tasks:
+        for key, value in context.items():
+            if value is not None:
+                task.setdefault(key, value)
+
+    case_ids = {str(task["case_id"]) for task in tasks}
+    recovered = _existing_summary_rows(summary_path, case_ids)
+    rows_by_case = {str(row["case_id"]): row for row in recovered}
+    processed = 0
+    if recovered:
+        print(
+            f"[resume] preserving {len(recovered)} row(s) from {summary_path.name}",
+            flush=True,
+        )
 
     def record(task: dict[str, Any], result=None, error: Exception | None = None) -> None:
+        nonlocal processed
         if error is None:
             row = result
             status = "ok"
@@ -280,16 +320,34 @@ def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> 
                 "stage": task["stage"],
                 "controller_name": task["controller"],
                 "combo": _mesh_tag(**task["mesh"]),
+                "campaign_id": task["campaign_id"],
+                "sizing_source_sha256": (
+                    sha256_file(Path(task["sizing_artifact"]))
+                    if task.get("sizing_artifact") else ""
+                ),
                 **task.get("labels", {}),
                 "status": "error",
                 "audit_pass": False,
                 "error": str(error),
             }
             status = f"FAILED: {error}"
-        rows.append(row)
-        pd.DataFrame(rows).to_csv(summary_path, index=False)
-        _write_progress(state_path, stage, len(rows), len(tasks), started)
-        print(f"[{len(rows)}/{len(tasks)}] {task['case_id']}: {status}", flush=True)
+        rows_by_case[str(task["case_id"])] = row
+        processed += 1
+        rows = list(rows_by_case.values())
+        _write_summary(summary_path, rows)
+        _write_progress(
+            state_path,
+            stage,
+            processed,
+            len(tasks),
+            started,
+            recovered_rows=len(recovered),
+        )
+        print(
+            f"[{processed}/{len(tasks)} | summary={len(rows)}] "
+            f"{task['case_id']}: {status}",
+            flush=True,
+        )
 
     if workers <= 1:
         for task in tasks:
@@ -306,7 +364,7 @@ def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> 
                     record(task, result=future.result())
                 except Exception as exc:
                     record(task, error=exc)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows_by_case.values())
 
 
 def _task(
@@ -611,7 +669,6 @@ def _selected_meshes(args) -> list[dict[str, int]]:
 
 
 def _refresh_baseline_costs(baseline: pd.DataFrame, out_root: Path) -> pd.DataFrame:
-    """Migrate completed May metrics to total realized-cost accounting."""
     baseline = baseline.copy()
     for index, row in baseline.iterrows():
         if not bool(row.get("audit_pass", False)):
@@ -620,13 +677,9 @@ def _refresh_baseline_costs(baseline: pd.DataFrame, out_root: Path) -> pd.DataFr
         case_dir = (
             out_root / "01-mesh" / str(row["controller_name"]) / str(row["combo"])
         )
-        operation_path = case_dir / "operation_final.csv"
-        if not operation_path.exists():
-            raise FileNotFoundError(
-                f"Cannot reuse May case without {operation_path}"
-            )
+        operation_path = operation_artifact_path(case_dir)
         cost_metrics = _operation_cost_metrics(
-            pd.read_csv(operation_path),
+            read_operation(operation_path),
             _base_params(mesh, seed=MONTHLY_OUTAGE_SEEDS[MONTHS[0]]),
         )
         for key, value in cost_metrics.items():
@@ -643,7 +696,6 @@ def _refresh_baseline_costs(baseline: pd.DataFrame, out_root: Path) -> pd.DataFr
 
 
 def stage_seasonal(args) -> pd.DataFrame:
-    """Validate every temporal mesh for 10 days in each test-year month."""
     root = args.out_root / "02-seasonal-mesh"
     baseline_month = MONTHS[0]
     tasks = []
@@ -794,7 +846,6 @@ def stage_robustness(args) -> pd.DataFrame:
 
 
 def _write_causal_pilot_comparison(summary: pd.DataFrame, path: Path) -> None:
-    """Compare LSTM and prototype rerun under the same physical model."""
     keys = ["month", "combo"]
     metrics = ["operation_total_cost", "avg_solve_time_s", "total_time_s"]
     available = [column for column in metrics if column in summary]
@@ -826,7 +877,6 @@ def _write_causal_pilot_comparison(summary: pd.DataFrame, path: Path) -> None:
 
 
 def stage_causal_pilot(args) -> pd.DataFrame:
-    """Run LSTM and prototype on three diagnostic meshes over all 12 months."""
     root = args.out_root / "00-causal-pilot"
     tasks = []
     for controller in SELECTION_CONTROLLERS:
@@ -872,8 +922,41 @@ def stage_smoke(args) -> pd.DataFrame:
 
 def write_manifest(args) -> None:
     args.out_root.mkdir(parents=True, exist_ok=True)
-    params = load_sized_parameters(PARAMS_JSON)
+    if args.sizing_artifact:
+        params = load_sized_parameters_from_artifact(args.parameters, args.sizing_artifact)
+    else:
+        params = load_sized_parameters(str(args.parameters))
+    sizing_source = Path(params["sizing_case_applied"]["source"])
+    sizing_sha256 = sha256_file(sizing_source)
+    parameters_sha256 = sha256_file(args.parameters)
+    manifest_path = args.out_root / "campaign_manifest.json"
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous_id = previous.get("campaign_id")
+        previous_inputs = previous.get("portable_inputs", {}) or {}
+        previous_sizing = previous_inputs.get("sizing_artifact_sha256")
+        previous_parameters = previous_inputs.get("parameters_sha256")
+        if previous_id and previous_id != args.campaign_id:
+            raise RuntimeError(
+                f"Output root belongs to campaign {previous_id!r}, not {args.campaign_id!r}"
+            )
+        if previous_sizing and previous_sizing != sizing_sha256:
+            raise RuntimeError("Output root already contains results from another sizing artifact")
+        if previous_parameters and previous_parameters != parameters_sha256:
+            raise RuntimeError("Output root already contains results from another parameter file")
+
+    inputs = args.out_root / "campaign-inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    parameters_copy = inputs / "parameters.json"
+    parameters_copy.write_bytes(args.parameters.read_bytes())
+    sizing_copy = inputs / "sizing_artifact.json"
+    sizing_copy.write_bytes(sizing_source.read_bytes())
+    (inputs / "operational_parameters.json").write_text(
+        json.dumps(params, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     manifest = {
+        "schema_version": 2,
+        "campaign_id": args.campaign_id,
         "operation_model_version": OPERATION_MODEL_VERSION,
         "cost_accounting_version": COST_ACCOUNTING_VERSION,
         "forecast_assembly_version": FORECAST_ASSEMBLY_VERSION,
@@ -881,6 +964,16 @@ def write_manifest(args) -> None:
         "created_at": pd.Timestamp.now().isoformat(),
         "legacy_results_preserved": True,
         "output_root": str(args.out_root),
+        "portable_inputs": {
+            "parameters": str(parameters_copy),
+            "parameters_sha256": parameters_sha256,
+            "sizing_artifact": str(sizing_copy),
+            "sizing_artifact_sha256": sizing_sha256,
+            "sizing_case": params["sizing_case_applied"]["case"],
+            "pv_size_kw": params["sizing_case_applied"]["P_hat_PV_kw"],
+            "bess_size_kwh": params["sizing_case_applied"]["E_hat_BESS_kwh"],
+            "bess_power_kw": params["sizing_case_applied"]["BESS_Pmax_kw"],
+        },
         "corrections": [
             "fixed physical outage support independent of dt1/dt2",
             "first-arrival hazard weights calibrated to the 24 h outage probability",
@@ -889,6 +982,7 @@ def write_manifest(args) -> None:
             "terminal energy after the last interval not below measured initial energy",
             "BESS wear charged on bidirectional throughput instead of absolute net power",
             "continuous realized load shedding consistent with the LP operational models",
+            "last-resort discharge reduction when export and PV curtailment cannot absorb surplus",
             "strict realized power-balance, outage-isolation, and BESS-state audits",
             "cache invalidation by model version, parameter fingerprint, and complete run signature",
             "hourly LSTM inputs restricted to fully completed observation hours",
@@ -933,9 +1027,30 @@ def write_manifest(args) -> None:
             ),
         },
     }
-    (args.out_root / "campaign_manifest.json").write_text(
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+
+def validate_campaign_definition(args) -> None:
+    definition = ROOT / "operation-campaigns" / args.campaign_id / "campaign.json"
+    if not definition.is_file():
+        return
+    payload = json.loads(definition.read_text(encoding="utf-8"))
+    if payload.get("campaign_id") != args.campaign_id:
+        raise RuntimeError(f"Invalid campaign definition: {definition}")
+    if not args.sizing_artifact:
+        raise RuntimeError(f"Campaign {args.campaign_id!r} requires --sizing-artifact")
+    expected_sizing = str(payload.get("sizing_artifact_sha256", ""))
+    expected_parameters = str(payload.get("parameters_sha256", ""))
+    if sha256_file(args.sizing_artifact) != expected_sizing:
+        raise RuntimeError(
+            f"Sizing artifact does not match campaign {args.campaign_id!r}: {args.sizing_artifact}"
+        )
+    if sha256_file(args.parameters) != expected_parameters:
+        raise RuntimeError(
+            f"Parameter file does not match campaign {args.campaign_id!r}: {args.parameters}"
+        )
 
 
 def parse_args(argv: Iterable[str] | None = None):
@@ -946,6 +1061,9 @@ def parse_args(argv: Iterable[str] | None = None):
         default="smoke",
     )
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
+    parser.add_argument("--parameters", type=Path, default=Path(PARAMS_JSON))
+    parser.add_argument("--sizing-artifact", type=Path)
+    parser.add_argument("--campaign-id", default="economic")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--n-iters", type=int, default=DEFAULT_N_ITERS)
     parser.add_argument("--smoke-iters", type=int, default=3)
@@ -955,10 +1073,32 @@ def parse_args(argv: Iterable[str] | None = None):
     return parser.parse_args(argv)
 
 
+def resolve_output_root(stage: str, out_root: Path) -> Path:
+    resolved = out_root.resolve()
+    if stage == "smoke" and resolved == DEFAULT_OUT_ROOT.resolve():
+        return DEFAULT_SMOKE_ROOT.resolve()
+    return resolved
+
+
 def main(argv: Iterable[str] | None = None) -> None:
     args = parse_args(argv)
     if args.workers < 1 or args.n_iters < 1 or args.smoke_iters < 1 or args.top_k < 1:
         raise ValueError("workers, n-iters, smoke-iters, and top-k must be positive")
+    args.parameters = args.parameters.resolve()
+    args.out_root = resolve_output_root(args.stage, args.out_root)
+    if not args.sizing_artifact:
+        default_artifact = ROOT / "operation-campaigns" / args.campaign_id / "sizing_artifact.json"
+        if default_artifact.is_file():
+            args.sizing_artifact = default_artifact
+    if args.sizing_artifact:
+        args.sizing_artifact = args.sizing_artifact.resolve()
+    validate_campaign_definition(args)
+    os.environ[PARAMETERS_ENV] = str(args.parameters)
+    os.environ[CAMPAIGN_ID_ENV] = str(args.campaign_id)
+    if args.sizing_artifact:
+        os.environ[SIZING_ARTIFACT_ENV] = str(args.sizing_artifact)
+    else:
+        os.environ.pop(SIZING_ARTIFACT_ENV, None)
     write_manifest(args)
     stages = {
         "smoke": stage_smoke,

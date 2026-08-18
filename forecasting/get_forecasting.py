@@ -1,36 +1,36 @@
-# -*- coding: utf-8 -*-
-# File: forecasting/get_forecasting.py
+"""LSTM forecaster used by the model predictive controller."""
 
 import os
-from typing import Dict, Any, Optional, Iterable, Union
+from typing import Any, Dict, Iterable, Optional, Union
+
 import numpy as np
 import pandas as pd
 from tensorflow.keras.models import load_model
 
-from opt.utils import slice_forecasts, build_time_grid
 import forecasting
 from forecasting.causal import FORECAST_ASSEMBLY_VERSION
+from opt.utils import build_time_grid, slice_forecasts
 
 
 DEFAULT_PATHS: Dict[str, str] = {
     "LOAD_VSTF_PATH": "models/lstm_vstf_load_5min_240min_96.keras",
-    "LOAD_ST_PATH":   "models/lstm_hourly_load_36h_8.keras",
-    "PV_VSTF_PATH":   "models/lstm_vstf_pv_5min_60min_48.keras",
-    "PV_ST_PATH":     "models/lstm_hourly_pv_36h_8.keras",
+    "LOAD_ST_PATH": "models/lstm_hourly_load_36h_8.keras",
+    "PV_VSTF_PATH": "models/lstm_vstf_pv_5min_60min_48.keras",
+    "PV_ST_PATH": "models/lstm_hourly_pv_36h_8.keras",
 }
 
 DEFAULT_CFGS: Dict[str, Any] = {
-    "VSTF_LOAD_CFG": {"step_minutes": 5,  "lookback_steps": 96, "horizon_steps": 48},
-    "ST_LOAD_CFG":   {"step_minutes": 60, "lookback_steps": 8,  "horizon_steps": 36},
-    "VSTF_PV_CFG":   {"step_minutes": 5,  "lookback_steps": 48, "horizon_steps": 12},
-    "ST_PV_CFG":     {"step_minutes": 60, "lookback_steps": 8,  "horizon_steps": 36},
+    "VSTF_LOAD_CFG": {"step_minutes": 5, "lookback_steps": 96, "horizon_steps": 48},
+    "ST_LOAD_CFG": {"step_minutes": 60, "lookback_steps": 8, "horizon_steps": 36},
+    "VSTF_PV_CFG": {"step_minutes": 5, "lookback_steps": 48, "horizon_steps": 12},
+    "ST_PV_CFG": {"step_minutes": 60, "lookback_steps": 8, "horizon_steps": 36},
 }
 
 DEFAULT_MISC: Dict[str, Any] = {
     "day_start": "06:00",
     "day_end": "19:00",
     "clip_to_unit": False,
-    "default_intervals": 432,  # 36h @ 5min
+    "default_intervals": 432,
     "default_dt_min": 5,
 }
 
@@ -59,10 +59,8 @@ def _build_variable_grid(start: pd.Timestamp, dt_seq: Iterable[int]) -> pd.Datet
     return pd.DatetimeIndex([start + pd.Timedelta(minutes=int(off)) for off in offsets])
 
 
-def _aggregate_to_intervals(s_5min: pd.Series,
-                            starts: pd.DatetimeIndex,
-                            dt_seq: Iterable[int],
-                            how: str = "mean") -> np.ndarray:
+def _aggregate_to_intervals(s_5min: pd.Series, starts: pd.DatetimeIndex,
+                            dt_seq: Iterable[int], how: str = "mean") -> np.ndarray:
     out = []
     dt_seq = [int(x) for x in dt_seq]
     for i, t0 in enumerate(starts):
@@ -91,9 +89,7 @@ def _as_series(x: Union[pd.Series, pd.DataFrame]) -> pd.Series:
     raise ValueError("Could not extract a numeric Series from provided actuals.")
 
 
-def get_window(start_dt0: pd.Timestamp,
-               load_kw_s: pd.DataFrame,
-               pv_kw_s: pd.DataFrame,
+def get_window(start_dt0: pd.Timestamp, load_kw_s: pd.DataFrame, pv_kw_s: pd.DataFrame,
                dt_min: Union[int, Iterable[int]]):
     if _is_iterable_ints(dt_min):
         times = _build_variable_grid(pd.Timestamp(start_dt0), [int(v) for v in dt_min])
@@ -116,25 +112,25 @@ class ForecastMPC:
                  load_scaling: float) -> None:
         self.params: Dict[str, Any] = {**DEFAULT_PATHS, **DEFAULT_CFGS, **DEFAULT_MISC, **(params or {})}
         self.load_s = _as_series(load_kw_s)
-        self.pv_s   = _as_series(pv_kw_s)
+        self.pv_s = _as_series(pv_kw_s)
         self.pv_scaling = float(pv_scaling)
         self.load_scaling = float(load_scaling)
 
         self.m_vstf_load = _load_keras(self.params["LOAD_VSTF_PATH"])
-        self.m_st_load   = _load_keras(self.params["LOAD_ST_PATH"])
-        self.m_vstf_pv   = _load_keras(self.params["PV_VSTF_PATH"])
-        self.m_st_pv     = _load_keras(self.params["PV_ST_PATH"])
+        self.m_st_load = _load_keras(self.params["LOAD_ST_PATH"])
+        self.m_vstf_pv = _load_keras(self.params["PV_VSTF_PATH"])
+        self.m_st_pv = _load_keras(self.params["PV_ST_PATH"])
 
         self.vstf_load_cfg = dict(self.params.get("VSTF_LOAD_CFG", {}))
-        self.st_load_cfg   = dict(self.params.get("ST_LOAD_CFG", {}))
-        self.vstf_pv_cfg   = dict(self.params.get("VSTF_PV_CFG", {}))
-        self.st_pv_cfg     = dict(self.params.get("ST_PV_CFG", {}))
+        self.st_load_cfg = dict(self.params.get("ST_LOAD_CFG", {}))
+        self.vstf_pv_cfg = dict(self.params.get("VSTF_PV_CFG", {}))
+        self.st_pv_cfg = dict(self.params.get("ST_PV_CFG", {}))
 
         self.day_start = self.params["day_start"]
         self.day_end = self.params["day_end"]
         self.clip_to_unit = bool(self.params["clip_to_unit"])
-        self.default_intervals = int(self.params["default_intervals"])  # 432
-        self.default_dt_min = int(self.params["default_dt_min"])        # 5
+        self.default_intervals = int(self.params["default_intervals"])
+        self.default_dt_min = int(self.params["default_dt_min"])
 
     def _infer_intervals(self, dt_min: int) -> int:
         if dt_min == int(self.vstf_load_cfg.get("step_minutes", 5)):
@@ -154,7 +150,6 @@ class ForecastMPC:
                       include_actuals: bool = False) -> Optional[Dict[str, Dict[pd.Timestamp, float]]]:
         start_dt0 = pd.Timestamp(start_dt0)
 
-        # --- Variable-step: map from 5-min base to dt_seq intervals
         if _is_iterable_ints(dt_min):
             dt_seq = [int(v) for v in dt_min]
             total_min = int(np.sum(dt_seq))
@@ -176,25 +171,23 @@ class ForecastMPC:
                 clip_to_unit=self.clip_to_unit,
             ), dtype=float) * self.pv_scaling
 
-            # prepend actual at start_dt0 and drop last to keep length
             if start_dt0 not in self.load_s.index or start_dt0 not in self.pv_s.index:
                 raise KeyError("start_dt0 must exist in actual series to anchor the first value.")
             y_load_5 = np.concatenate(([float(self.load_s.at[start_dt0])], y_load_5[:-1]))
-            y_pv_5   = np.concatenate(([float(self.pv_s.at[start_dt0])],   y_pv_5[:-1]))
+            y_pv_5 = np.concatenate(([float(self.pv_s.at[start_dt0])], y_pv_5[:-1]))
 
             times_5 = pd.date_range(start=start_dt0, periods=self.default_intervals, freq="5min")
             s_load_5 = pd.Series(y_load_5, index=times_5)
-            s_pv_5   = pd.Series(y_pv_5,   index=times_5)
+            s_pv_5 = pd.Series(y_pv_5, index=times_5)
 
             y_load = _aggregate_to_intervals(s_load_5, times_var, dt_seq, how="mean")
-            y_pv   = _aggregate_to_intervals(s_pv_5,   times_var, dt_seq, how="mean")
+            y_pv = _aggregate_to_intervals(s_pv_5, times_var, dt_seq, how="mean")
 
             return {
                 "load_kw": dict(zip(times_var, y_load.tolist())),
-                "pv_kw":   dict(zip(times_var, y_pv.tolist())),
+                "pv_kw": dict(zip(times_var, y_pv.tolist())),
             }
 
-        # --- Uniform-step: direct grid
         step = int(dt_min) if dt_min is not None else self.default_dt_min
         steps_out = int(intervals) if intervals is not None else self._infer_intervals(step)
         times = pd.date_range(start=start_dt0, periods=steps_out, freq=f"{step}min")
@@ -217,14 +210,14 @@ class ForecastMPC:
             raise KeyError("start_dt0 must exist in actual series to anchor the first value.")
 
         y_load_out = np.empty(steps_out, dtype=float)
-        y_pv_out   = np.empty(steps_out, dtype=float)
+        y_pv_out = np.empty(steps_out, dtype=float)
         y_load_out[0] = float(self.load_s.at[start_dt0])
-        y_pv_out[0]   = float(self.pv_s.at[start_dt0])
+        y_pv_out[0] = float(self.pv_s.at[start_dt0])
         if steps_out > 1:
             y_load_out[1:] = y_load_fc[:-1]
-            y_pv_out[1:]   = y_pv_fc[:-1]
+            y_pv_out[1:] = y_pv_fc[:-1]
 
         return {
             "load_kw": dict(zip(times, y_load_out.tolist())),
-            "pv_kw":   dict(zip(times, y_pv_out.tolist())),
+            "pv_kw": dict(zip(times, y_pv_out.tolist())),
         }

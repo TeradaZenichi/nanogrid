@@ -84,6 +84,30 @@ class GridEnvBalanceTests(unittest.TestCase):
         self.assertEqual(row["P_grid_in_kw"], 0.0)
         self.assertEqual(row["P_grid_out_kw"], 0.0)
 
+    def test_ongrid_discharge_surplus_is_reduced_after_export_saturates(self):
+        load_kw = 1.45321831453
+        command_kw = 2.47166003097
+        env = _offgrid_env(load_kw=load_kw, pv_kw=0.0, energy_kwh=4.0)
+        env.mode = "ongrid"
+        env.outage_active = False
+        env.outage_end_time = None
+        env._outage_calendar = []
+        env.bess.update(P_max=3.0, ramp=3.0, E_max=5.0, E_nom=5.0)
+        env.grid_caps["P_export_max"] = 1.0
+
+        row, done = env.step(command_kw, None, None)
+
+        expected_bess_kw = load_kw + env.grid_caps["P_export_max"]
+        expected_reduction_kw = command_kw - expected_bess_kw
+        self.assertTrue(done)
+        self.assertAlmostEqual(row["P_grid_out_kw"], 1.0)
+        self.assertAlmostEqual(row["P_bess_kw"], expected_bess_kw)
+        self.assertAlmostEqual(row["Residual_kw"], 0.0)
+        self.assertAlmostEqual(
+            row["clamps"]["ongrid_emergency_reduce_discharge"]["kW"],
+            expected_reduction_kw,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

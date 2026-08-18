@@ -1,15 +1,11 @@
-"""Generate publication-ready figures and LaTeX tables for the annual mesh sweep.
-
-The source campaign contains 27 temporal meshes, three controllers, and twelve
-paired 10-day monthly windows (972 audited simulations). Outputs are written to
-``Results/02-seasonal-mesh/publication`` by default.
-"""
+"""Generate publication artifacts for the annual temporal-mesh sweep."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -23,10 +19,12 @@ from scipy import stats
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = ROOT / "Results" / "02-seasonal-mesh" / "summary.csv"
-DEFAULT_SELECTION = ROOT / "Results" / "02-seasonal-mesh" / "champion_mesh.csv"
-DEFAULT_CHAMPION = ROOT / "Results" / "champion_mesh.json"
-DEFAULT_OUTPUT = ROOT / "Results" / "02-seasonal-mesh" / "publication"
+sys.path.insert(0, str(ROOT))
+
+from opt.campaigns import campaign_layout, load_campaign_provenance, validate_summary_provenance
+
+
+DEFAULT_CAMPAIGN_ROOT = ROOT / "outputs" / "sweeps" / "economic"
 GULLIVER_FONT = ROOT / "data" / "Gulliver.otf"
 
 CONTROLLERS = ("ideal", "lstm", "prototype")
@@ -44,8 +42,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_and_validate(path: Path) -> pd.DataFrame:
+def _load_and_validate(path: Path, provenance) -> pd.DataFrame:
     df = pd.read_csv(path)
+    validate_summary_provenance(df, provenance, "annual mesh")
     required = {
         "month", "combo", "h", "t1", "t2", "controller_name", "audit_pass",
         "operation_total_cost", "operation_grid_reliability_cost",
@@ -431,7 +430,13 @@ def write_champion_comparison(df: pd.DataFrame, champion: dict, path: Path) -> N
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def write_readme(df: pd.DataFrame, champion: dict, path: Path) -> None:
+def write_readme(
+    df: pd.DataFrame,
+    champion: dict,
+    path: Path,
+    campaign_root: Path,
+    campaign_id: str,
+) -> None:
     tag = f"h{champion['h']}_t1_{champion['t1']}_t2_{champion['t2']}"
     selected = df[df.combo == tag]
     totals = selected.groupby("controller_name")["operation_total_cost"].sum()
@@ -474,7 +479,7 @@ and prototype, not the minimum-cost mesh of the ideal target.
 ## Reproduction
 
 ```powershell
-.\\.venv\\Scripts\\python.exe experiments\\13_generate_publication_artifacts.py
+.\\.venv\\Scripts\\python.exe experiments\\13_generate_publication_artifacts.py --campaign-root {campaign_root.relative_to(ROOT).as_posix()} --campaign-id {campaign_id}
 ```
 """
     path.write_text(text, encoding="utf-8")
@@ -482,13 +487,22 @@ and prototype, not the minimum-cost mesh of the ideal target.
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--selection", type=Path, default=DEFAULT_SELECTION)
-    parser.add_argument("--champion", type=Path, default=DEFAULT_CHAMPION)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--campaign-root", type=Path, default=DEFAULT_CAMPAIGN_ROOT)
+    parser.add_argument("--campaign-id")
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--selection", type=Path)
+    parser.add_argument("--champion", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    df = _load_and_validate(args.input)
+    args.campaign_root = args.campaign_root.resolve()
+    layout = campaign_layout(args.campaign_root)
+    args.input = (args.input or layout["summary"]).resolve()
+    args.selection = (args.selection or (layout["seasonal"] / "champion_mesh.csv")).resolve()
+    args.champion = (args.champion or layout["champion"]).resolve()
+    args.output = (args.output or layout["publication"]).resolve()
+    provenance = load_campaign_provenance(args.campaign_root, args.campaign_id)
+    df = _load_and_validate(args.input, provenance)
     champion = json.loads(args.champion.read_text(encoding="utf-8"))
     mesh = {key: int(champion[key]) for key in ("h", "t1", "t2")}
     args.output.mkdir(parents=True, exist_ok=True)
@@ -503,9 +517,14 @@ def main() -> None:
     write_full_table(summary, mesh, args.output / "mesh_full_table.tex")
     write_ranked_table(args.selection, args.output / "mesh_ranked_table.tex")
     write_champion_comparison(df, mesh, args.output / "mesh_champion_comparison.tex")
-    write_readme(df, mesh, args.output / "README.md")
+    write_readme(
+        df, mesh, args.output / "README.md",
+        args.campaign_root, provenance.campaign_id,
+    )
 
     manifest = {
+        "campaign_id": provenance.campaign_id,
+        "sizing_source_sha256": provenance.sizing_source_sha256,
         "source": str(args.input),
         "source_sha256": _sha256(args.input),
         "rows": len(df),

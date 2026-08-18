@@ -1,10 +1,4 @@
-# -*- coding: utf-8 -*-
-"""Scenario-based operation model over (time, scenario, contingency).
-
-A single shared control trajectory is optimized for all scenarios, cached,
-and served by timestamp; the operation layer re-solves periodically.
-Scenarios come from the same train clusters used by the sizing model.
-"""
+"""Scenario-based operation with a shared battery trajectory."""
 
 from __future__ import annotations
 
@@ -39,7 +33,6 @@ from .utils import (
 )
 
 
-# Scenario inputs (same prototypes/probabilities used by the sizing model)
 PV_PROTOTYPES_CSV = "data/sizing/prototypes_pv_dtw_train.csv"
 LOAD_PROTOTYPES_CSV = "data/sizing/prototypes_load_dtw_all_train.csv"
 JOINT_PROB_CSV = "data/sizing/prob_joint_load_pv.csv"
@@ -359,7 +352,6 @@ class OnGridStochasticOperation:
         E_hat_kwh: float = 0.0,
         P_bess_hat_kw: float = 0.0,
     ):
-        # forecasts is intentionally unused here; operation is driven by train clusters.
         _ = forecasts
 
         tdata = self.param.build_time_data(start_dt)
@@ -430,7 +422,6 @@ class OnGridStochasticOperation:
         m.eta_d = Param(initialize=float(self.param.data["eta_d"]))
         m.R_bess = Param(initialize=float(self.param.data["R_bess_kw_per_step"]))
 
-        # BESS constraints
         m.PbessLink = Constraint(m.T, rule=lambda _m, t: _m.P_bess[t] == _m.P_dis[t] - _m.P_ch[t])
         m.Dynamics = Constraint(
             m.TRANS,
@@ -492,7 +483,6 @@ class OnGridStochasticOperation:
                 >= m.E_hat
             )
 
-        # Grid and outage constraints
         m.GridImportCap = Constraint(
             m.T,
             m.S,
@@ -560,7 +550,6 @@ class OnGridStochasticOperation:
             else Constraint.Skip,
         )
 
-        # Balance for all scenario/contingency combinations with shared controls.
         m.Balance = Constraint(
             m.T,
             m.S,
@@ -677,13 +666,8 @@ class OnGridStochasticOperation:
                 }
             )
 
-        # Each action is valid over its model timestep.
         self._action_times = [pd.Timestamp(t) for t in self._times]
-        last_dt = (
-            self._times[-1] - self._times[-2]
-            if len(self._times) >= 2
-            else timedelta(minutes=5)
-        )
+        last_dt = self._times[-1] - self._times[-2] if len(self._times) >= 2 else timedelta(minutes=5)
         self._plan_end = pd.Timestamp(self._times[-1] + last_dt)
 
     def get_control_at(self, now) -> Dict[str, float]:
