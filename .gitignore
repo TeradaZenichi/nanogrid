@@ -6,7 +6,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-/outputs/
+# Keep generated outputs ignored by default, but version the compact sizing
+# decisions required to reproduce the operational campaigns on another clone.
+/outputs/*
+!/outputs/sizing-sweep/
+!/outputs/sizing-sweep/**
 tmp/
 /figures/
 predictions/

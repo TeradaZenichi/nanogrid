@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "parameters": "C:/Users/Lucas/Code/nanogrid/outputs/sizing-sweep/with-degradation/parameters.json",
+  "parameters_sha256": "f06aa1c0180743f36f4f1b33f51146f5963efa65e84a63039d7bad7947e64d29",
+  "policy": "minimum pointwise served-load fraction during every modeled outage",
+  "stress_scenarios": {
+    "method": "zero-probability feasibility scenarios from training data",
+    "pv_assumption": "zero available PV throughout the stress day",
+    "slots": 48,
+    "load_clusters": [
+      6,
+      7
+    ],
+    "pv_cluster": 4,
+    "profiles": [
+      {
+        "cluster_load": 6,
+        "day": "2007-03-04",
+        "tail_modes": [
+          "night_peak"
+        ]
+      },
+      {
+        "cluster_load": 7,
+        "day": "2007-01-21",
+        "tail_modes": [
+          "maximum_outage_energy"
+        ]
+      }
+    ],
+    "objective_probability_mass": 0.9999999999999991
+  },
+  "tail_statistics": {
+    "train": {
+      "source": "C:/Users/Lucas/Code/nanogrid/data/load_5min_train.csv",
+      "complete_days": 861,
+      "night_peak_kw": 4.9570753151957545,
+      "night_peak_timestamp": "2007-03-04T19:30:00",
+      "night_peak_day": "2007-03-04",
+      "maximum_outage_energy_kwh": 6.21709798717098,
+      "maximum_outage_energy_end": "2007-01-21T22:10:00",
+      "maximum_outage_energy_day": "2007-01-21",
+      "outage_duration_hours": 2.0
+    },
+    "test": {
+      "source": "C:/Users/Lucas/Code/nanogrid/data/load_5min_test.csv",
+      "complete_days": 369,
+      "night_peak_kw": 5.0,
+      "night_peak_timestamp": "2009-11-24T19:35:00",
+      "night_peak_day": "2009-11-24",
+      "maximum_outage_energy_kwh": 5.161313177394381,
+      "maximum_outage_energy_end": "2010-01-15T21:45:00",
+      "maximum_outage_energy_day": "2010-01-15",
+      "outage_duration_hours": 2.0
+    }
+  },
+  "selected_cases": [
+    {
+      "case_id": "full_100",
+      "label": "Full-load resilience",
+      "service_fraction": 1.0,
+      "pv_credit_mode": "none"
+    }
+  ],
+  "updated_at_utc": "2026-08-20T23:55:46.475902+00:00",
+  "cases": [
+    {
+      "case_id": "full_100",
+      "minimum_service_fraction": 1.0,
+      "pv_size_kw": 2.5744694058993547,
+      "bess_size_kwh": 13.011933412961548,
+      "bess_power_kw": 5.20477336518462,
+      "capex_usd": 17690.597599157863,
+      "npv_opex_usd": 4813.687680388987,
+      "objective_usd": 22504.28527954685,
+      "expected_shed_kwh_day_y1": 1.2530032022720193e-11,
+      "conditional_outage_shed_kwh_y1": 1.0699907348789756e-10,
+      "minimum_service_fraction_last_year": 1.0,
+      "test_power_margin_kw_last_year": 1.5040490815102219,
+      "test_energy_margin_kwh_last_year": 8.17960657000334,
+      "test_tail_pass_last_year": true,
+      "runtime_seconds": 320.7585676999297,
+      "solver_status": "ok",
+      "termination_condition": "optimal"
+    }
+  ]
+}

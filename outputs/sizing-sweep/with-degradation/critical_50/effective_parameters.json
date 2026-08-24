@@ -1,0 +1,163 @@
+{
+  "economics": {
+    "currency": "USD",
+    "base_year": 2023,
+    "scope": "Synthetic U.S. residential benchmark",
+    "documentation": "data/readme.md"
+  },
+  "time": {
+    "horizon_hours": 36,
+    "timestep": 5,
+    "timestep_1_min": 5,
+    "timestep_2_min": 60
+  },
+  "costs": {
+    "c_shed_per_kwh": 5.0,
+    "c_pv_curt_per_kwh": 0.001,
+    "c_export_per_kwh": 0.1,
+    "bess_degradation_per_kwh": 0.0913242009,
+    "EDS": {
+      "00:00": 0.125,
+      "01:00": 0.125,
+      "02:00": 0.125,
+      "03:00": 0.125,
+      "04:00": 0.125,
+      "05:00": 0.125,
+      "06:00": 0.125,
+      "07:00": 0.125,
+      "08:00": 0.125,
+      "09:00": 0.125,
+      "10:00": 0.125,
+      "11:00": 0.125,
+      "12:00": 0.125,
+      "13:00": 0.125,
+      "14:00": 0.125,
+      "15:00": 0.125,
+      "16:00": 0.19,
+      "17:00": 0.19,
+      "18:00": 0.34,
+      "19:00": 0.34,
+      "20:00": 0.34,
+      "21:00": 0.19,
+      "22:00": 0.125,
+      "23:00": 0.125
+    }
+  },
+  "EDS": {
+    "outage_probability_pct": 10.0,
+    "outage_probability_reference_hours": 24.0,
+    "contingency_spacing_hours": 2.0,
+    "contingency_probability_model": "homogeneous_first_arrival_hazard",
+    "outage_duration_std_dev_frac": 0.5,
+    "outage_duration_hours": 2.0,
+    "seed": 42,
+    "Pmax": 5.0,
+    "Pmin": 1.0,
+    "scenario_description": "Synthetic low-reliability distribution grid stress test"
+  },
+  "BESS": {
+    "vendor_model": "Generic residential LFP BESS",
+    "benchmark_url": "https://atb.nrel.gov/electricity/2024/residential_battery_storage",
+    "chemistry": "LFP",
+    "Pmax_kw": 5.0,
+    "Emax_kwh": 12.5,
+    "DoD_frac": 0.9,
+    "eta_c": 0.9219544457,
+    "eta_d": 0.9219544457,
+    "crate_per_h": 0.4,
+    "ramp_kw_per_step": 5.0,
+    "ramp_reference_min": 5.0,
+    "terminal_energy_policy": "initial",
+    "E_init_kwh": 6.25,
+    "capex_per_kwh": 1043.0,
+    "replacement_cost_per_kwh": 1000.0,
+    "replacement_cost_basis": "Rounded full-system replacement proxy derived from the DOE/SETO 2024Q1 residential PV and PV-plus-ESS MSP benchmarks, in 2023 USD.",
+    "cycle_life_full": 5475,
+    "design_life_years": 15,
+    "noisy": false,
+    "noise": {
+      "type": "gauss",
+      "std_frac": 0.05,
+      "std_kw": 0.0,
+      "seed": 123
+    }
+  },
+  "PV": {
+    "Pmax_kw": 5.0,
+    "capex_per_kw": 1600.0,
+    "fixed_om_per_kw_year": 12.0,
+    "capex_reference": "Anderson et al. (2021), Advances in Applied Energy 3, 100049: PV capital cost = 1600 USD/kW and fixed O&M = 12 USD/kW-year."
+  },
+  "Load": {
+    "Pmax_kw": 5.0
+  },
+  "sizing": {
+    "npv_years": 25,
+    "discount_rate": 0.08,
+    "days_per_year": 365.0,
+    "P_PV_size_max_kw": 5.0,
+    "E_BESS_size_max_kwh": 25.0,
+    "contingency_step_slots": 4,
+    "include_zero_prob_scenarios": true,
+    "bess_eol_capacity_frac": 0.8,
+    "bess_calendar_fade_per_year": 0.0,
+    "bess_cyclic_fade_per_kwh": 1.82648402e-05,
+    "pv_degradation_year1_frac": 0.01,
+    "pv_degradation_linear_frac": 0.004,
+    "pv_degradation_reference": "Trina Vertex S+ datasheet: first-year degradation <= 1%, subsequent annual degradation <= 0.4%.",
+    "minimum_outage_load_served_fraction": 0.5,
+    "resilience_peak_load_kw": 5.0,
+    "resilience_outage_energy_kwh": 6.21709798717098
+  },
+  "resilience_sizing": {
+    "minimum_outage_load_served_fractions": [
+      0.0,
+      0.5,
+      1.0
+    ],
+    "E_BESS_size_max_kwh": 25.0,
+    "stress_scenarios": "Training-set night peak and maximum 2-hour load energy, both paired with zero PV and assigned zero objective probability.",
+    "validation_split": "test",
+    "replacement_policy": "No replacement; power and energy adequacy are enforced in every planning year."
+  },
+  "sensitivity": {
+    "discount_rate": [
+      0.05,
+      0.08,
+      0.12
+    ],
+    "c_shed_per_kwh": [
+      2.0,
+      5.0,
+      10.0
+    ],
+    "pv_capex_per_kw": [
+      1600.0,
+      2200.0,
+      2740.0
+    ],
+    "bess_capex_per_kwh": [
+      750.0,
+      1043.0,
+      1300.0
+    ],
+    "bess_calendar_fade_per_year": [
+      0.0,
+      0.005,
+      0.01
+    ],
+    "outage_probability_pct": [
+      2.0,
+      5.0,
+      10.0
+    ]
+  },
+  "profiles": {
+    "fL": [
+      0.8
+    ],
+    "fPV": [
+      0.6
+    ]
+  }
+}
