@@ -14,6 +14,7 @@
   "costs": {
     "c_shed_per_kwh": 5.0,
     "c_pv_curt_per_kwh": 0.001,
+    "c_export_per_kwh": 0.1,
     "bess_degradation_per_kwh": 0.0913242009,
     "EDS": {
       "00:00": 0.125, "01:00": 0.125, "02:00": 0.125, "03:00": 0.125,
@@ -65,8 +66,9 @@
   },
   "PV": {
     "Pmax_kw": 5.0,
-    "capex_per_kw": 2740.0,
-    "capex_reference": "DOE/SETO 2024Q1 benchmark: residential PV MSP = 2.74 USD/Wdc in 2023 USD."
+    "capex_per_kw": 1600.0,
+    "fixed_om_per_kw_year": 12.0,
+    "capex_reference": "Anderson et al. (2021), Advances in Applied Energy 3, 100049: PV capital cost = 1600 USD/kW and fixed O&M = 12 USD/kW-year."
   },
   "Load": {
     "Pmax_kw": 5.0
@@ -96,7 +98,7 @@
   "sensitivity": {
     "discount_rate": [0.05, 0.08, 0.12],
     "c_shed_per_kwh": [2.0, 5.0, 10.0],
-    "pv_capex_per_kw": [2200.0, 2740.0, 3300.0],
+    "pv_capex_per_kw": [1600.0, 2200.0, 2740.0],
     "bess_capex_per_kwh": [750.0, 1043.0, 1300.0],
     "bess_calendar_fade_per_year": [0.0, 0.005, 0.01],
     "outage_probability_pct": [2.0, 5.0, 10.0]

@@ -20,7 +20,9 @@ Values described as *derived* are calculated from linked source data. Values des
 
 ### 2.1 PV and BESS capital costs
 
-The [DOE/SETO 2024Q1 benchmark](https://www.energy.gov/cmei/systems/solar-photovoltaic-system-cost-benchmarks) reports an MSP of 2.74 USD/Wdc for an 8 kWdc residential PV system and 4.50 USD/Wdc for an 8 kWdc PV system coupled to a 13.5 kWh BESS. The source expresses all costs in 2023 USD. The incremental storage cost is
+The central theoretical PV case adopts a capital cost of 1,600 USD/kW and fixed O&M of 12 USD/(kW year), following the microgrid resilience assumptions of [Anderson et al. (2021)](https://doi.org/10.1016/j.adapen.2021.100049). These values describe a literature-based prospective microgrid scenario rather than the observed installed cost of a small residential system.
+
+For comparison, the [DOE/SETO 2024Q1 benchmark](https://www.energy.gov/cmei/systems/solar-photovoltaic-system-cost-benchmarks) reports an MSP of 2.74 USD/Wdc for an 8 kWdc residential PV system and 4.50 USD/Wdc for an 8 kWdc PV system coupled to a 13.5 kWh BESS. The source expresses all costs in 2023 USD. The DOE value is retained as the upper PV-cost sensitivity. Its incremental storage cost is
 
 \[
 c_{\mathrm{BESS}}^{\mathrm{cap}}
@@ -52,6 +54,10 @@ The hourly levels are author-defined and must not be described as the tariff of 
 ### 2.3 Value of lost load
 
 The base load-shedding coefficient is 5 USD/kWh, matching the residential VOLL used by the [DOE National Transmission Planning Study](https://www.energy.gov/sites/default/files/2024-10/NationalTransmissionPlanningStudy-Chapter5.pdf). Sensitivities of 2 and 10 USD/kWh are [configured author assumptions](parameters.json). A much larger coefficient, such as 1,000 USD/kWh, may be used only as a numerical feasibility penalty and must not be reported as empirical residential VOLL.
+
+### 2.4 Export compensation
+
+Exported energy is compensated at a fixed rate of 0.10 USD/kWh. Imports retain the time-of-use tariff defined above, so the model distinguishes the price paid for grid energy from the compensation received for surplus PV generation. The resilience sizing campaign varies the minimum served-load fraction during outages (0%, 50%, and 100%) while keeping this export compensation fixed.
 
 ## 3. Low-reliability grid stress test
 

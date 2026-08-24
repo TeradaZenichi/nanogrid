@@ -101,6 +101,7 @@ class Parameters:
 
         self.c_shed_per_kwh = float(self.cost_cfg.get("c_shed_per_kwh", 1000.0))
         self.c_pv_curt_per_kwh = float(self.cost_cfg.get("c_pv_curt_per_kwh", 0.0))
+        self.c_export_per_kwh = float(self.cost_cfg.get("c_export_per_kwh", 0.0))
         self.tou_map = dict(self.cost_cfg.get("EDS", {}))
 
         if "bess_degradation_per_kwh" in self.cost_cfg:
@@ -116,6 +117,7 @@ class Parameters:
                 self.sizing_cfg.get("capex_pv_per_kw", 0.0),
             )
         )
+        self.c_pv_fixed_om_per_kw_year = float(self.pv_cfg.get("fixed_om_per_kw_year", 0.0))
         self.c_bess_capex_per_kwh = float(
             self.bess_cfg.get(
                 "capex_per_kwh",
@@ -288,12 +290,14 @@ class Parameters:
         model.P_EDS_out_max = pyo.Param(initialize=max(0.0, self.p_eds_out_max_kw))
 
         model.c_EDS = pyo.Param(model.T, initialize=lambda _, t: self.c_eds_at_slot(int(t), bundle["dt_h"]))
+        model.c_EDS_out = pyo.Param(initialize=max(0.0, self.c_export_per_kwh))
         model.c_L_shed = pyo.Param(initialize=self.c_shed_per_kwh)
         model.c_PV_curt = pyo.Param(initialize=self.c_pv_curt_per_kwh)
         model.c_BESS_deg = pyo.Param(initialize=self.c_bess_deg_per_kwh)
 
         model.c_CAPEX_PV = pyo.Param(initialize=self.c_pv_capex_per_kw)
         model.c_CAPEX_BESS = pyo.Param(initialize=self.c_bess_capex_per_kwh)
+        model.c_OM_PV = pyo.Param(initialize=max(0.0, self.c_pv_fixed_om_per_kw_year))
 
         model.eta_BESS_c = pyo.Param(initialize=self.eta_bess_c)
         model.eta_BESS_d = pyo.Param(initialize=self.eta_bess_d)
@@ -842,6 +846,7 @@ class MicrogridDesign:
                 * _m.dt_h[t]
                 * (
                     _m.c_EDS[t] * _m.P_EDS_in[t, s, c, y]
+                    - _m.c_EDS_out * _m.P_EDS_out[t, s, c, y]
                     + _m.c_L_shed * _m.P_L_shed[t, s, c, y]
                     + _m.c_PV_curt * _m.P_PV_curt[t, s, c, y]
                     + _m.c_BESS_deg * (_m.P_BESS_c[t, s, c, y] + _m.P_BESS_d[t, s, c, y])
@@ -851,7 +856,10 @@ class MicrogridDesign:
                 for c in _m.C
             ),
         )
-        m.OPEX_annual = pyo.Expression(m.Y, rule=lambda _m, y: _m.days_per_year * _m.OPEX_day[y])
+        m.OPEX_annual = pyo.Expression(
+            m.Y,
+            rule=lambda _m, y: _m.days_per_year * _m.OPEX_day[y] + _m.c_OM_PV * _m.P_hat_PV,
+        )
         m.NPV_OPEX = pyo.Expression(
             expr=sum(m.OPEX_annual[y] / ((1.0 + m.discount_rate) ** y) for y in m.Y)
         )

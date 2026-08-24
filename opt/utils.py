@@ -18,6 +18,7 @@ DEFAULT_OPERATION_YEAR = 1
 DEFAULT_SIZING_ARTIFACT = Path(
     'paper/sizing/economic/degradation/sizing_decision_variables.json'
 )
+BESS_ZERO_TOLERANCE_KWH = 1e-6
 
 
 def detect_solver() -> str:
@@ -127,13 +128,19 @@ def _apply_sizing_data(params: Dict[str, Any], data: Dict[str, Any],
     bess = out["BESS"]
     e_old = float(bess["Emax_kwh"])
     p_old = float(bess["Pmax_kw"])
-    e_new = float(e_bess)
-    e_init_new = float(e_init)
-    if not 0.0 <= e_init_new <= e_new:
+    e_raw = float(e_bess)
+    e_init_raw = float(e_init)
+    if not 0.0 <= e_init_raw <= e_raw:
         raise ValueError(
             f"Sizing case '{case}' has invalid cyclic initial energy: "
-            f"E_init={e_init_new}, Emax={e_new}"
+            f"E_init={e_init_raw}, Emax={e_raw}"
         )
+    if e_raw <= BESS_ZERO_TOLERANCE_KWH:
+        e_new = 0.0
+        e_init_new = 0.0
+    else:
+        e_new = e_raw
+        e_init_new = e_init_raw
 
     out["PV"]["Pmax_kw"] = float(p_pv)
     bess["Emax_kwh"] = e_new
@@ -148,6 +155,10 @@ def _apply_sizing_data(params: Dict[str, Any], data: Dict[str, Any],
         "P_hat_PV_kw": float(p_pv),
         "E_hat_BESS_kwh": e_new,
         "E_BESS_init_kwh": e_init_new,
+        "E_hat_BESS_raw_kwh": e_raw,
+        "E_BESS_init_raw_kwh": e_init_raw,
+        "BESS_zero_tolerance_kwh": BESS_ZERO_TOLERANCE_KWH,
+        "BESS_zeroed_as_numerical_residual": bool(e_raw <= BESS_ZERO_TOLERANCE_KWH),
         "BESS_initial_soc_fraction": (e_init_new / e_new) if e_new > 0.0 else 0.0,
         "BESS_Pmax_kw": float(bess["Pmax_kw"]),
     }

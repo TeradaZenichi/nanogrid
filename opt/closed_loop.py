@@ -83,13 +83,16 @@ def run_mpc_closed_loop(*, env, mpc, forecaster, solver_opts: Mapping[str, Any],
                     E_hat_kwh=float(env.E_meas),
                     P_bess_hat_kw=previous_bess_kw,
                 )
-                mpc.solve(tee=False, **dict(solver_opts))
+                results = mpc.solve(tee=False, **dict(solver_opts))
                 solve_time_total += time.perf_counter() - solve_t0
-                n_solve_ok += 1
+                termination = str(results.solver.termination_condition).lower()
+                if termination not in {"optimal", "feasible", "maxtimelimit"}:
+                    raise RuntimeError(f"solver termination: {termination}")
                 max_simultaneity_kw = max(
                     max_simultaneity_kw, mpc.max_simultaneous_charge_discharge_kw()
                 )
                 first_step = mpc.extract_first_step(scenario="c0")
+                n_solve_ok += 1
             except Exception as error:
                 n_solve_fail += 1
                 print(f"[mpc] WARN: solve failed at {now}: {error}. Using safe fallback.")

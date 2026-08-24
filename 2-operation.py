@@ -1,8 +1,7 @@
-"""Run the corrected and resumable operational campaign."""
+"""Run the paper's corrected and resumable operational campaigns."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -10,11 +9,12 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from forecasting import PerfectForecast, PrototypeForecast
@@ -29,19 +29,25 @@ from opt.operation import (
     parameter_fingerprint,
     validate_time_mesh,
 )
-from opt.utils import (
-    load_series_scaled,
-    load_sized_parameters,
-    load_sized_parameters_from_artifact,
-)
+from opt.utils import load_series_scaled, load_sized_parameters, load_sized_parameters_from_artifact
 
 
-PARAMS_JSON = "data/parameters.json"
-LOAD_CSV = "data/load_5min_test.csv"
-PV_CSV = "data/pv_5min_test.csv"
-DEFAULT_OUT_ROOT = Path("outputs") / "sweeps" / "economic"
-DEFAULT_SMOKE_ROOT = Path("outputs") / "_smoke-pipeline"
+PARAMS_JSON = str(ROOT / "data" / "parameters.json")
+LOAD_CSV = str(ROOT / "data" / "load_5min_test.csv")
+PV_CSV = str(ROOT / "data" / "pv_5min_test.csv")
+SIZING_ROOT = ROOT / "outputs" / "sizing-sweep" / "with-degradation"
+OPERATION_ROOT = ROOT / "outputs" / "operation-sweep" / "with-degradation"
+DEFAULT_OUT_ROOT = OPERATION_ROOT
+DEFAULT_SMOKE_ROOT = ROOT / "outputs" / "_smoke-pipeline"
 DEFAULT_N_ITERS = 2880
+STAGE = "all"
+WORKERS = 4
+N_ITERS = DEFAULT_N_ITERS
+SMOKE_ITERS = 3
+TOP_K = 3
+FORECAST_CONTROLLERS = "ideal,prototype,lstm"
+FRESH = False
+SIZING_CASES = ("economic", "critical_50", "full_100")
 PARAMETERS_ENV = "NANOGRID_OPERATION_PARAMETERS"
 SIZING_ARTIFACT_ENV = "NANOGRID_OPERATION_SIZING_ARTIFACT"
 CAMPAIGN_ID_ENV = "NANOGRID_OPERATION_CAMPAIGN_ID"
@@ -53,20 +59,22 @@ EVALUATION_CONTROLLERS = ("ideal", "prototype", "lstm")
 SELECTION_CONTROLLERS = ("prototype", "lstm")
 MESH_CONTROLLERS = EVALUATION_CONTROLLERS  # Backward-compatible public alias.
 MESH_SELECTION_VERSION = "operational-forecaster-regret-annual-wear-v5"
-MESH_SELECTION_WEIGHTS = {
-    "mean_regret": 0.4,
-    "max_regret": 0.4,
-    "solve_time": 0.2,
-}
+MESH_SELECTION_WEIGHTS = {"mean_regret": 0.4, "max_regret": 0.4, "solve_time": 0.2}
 
-CAUSAL_PILOT_MESHES = (
-    {"h": 12, "t1": 5, "t2": 30},
-    {"h": 12, "t1": 5, "t2": 120},
-    {"h": 36, "t1": 5, "t2": 30},
-)
+CAUSAL_PILOT_MESHES = ({"h": 12, "t1": 5, "t2": 30}, {"h": 12, "t1": 5, "t2": 120}, {"h": 36, "t1": 5, "t2": 30})
 MONTHS = (
-    "2009-05", "2009-06", "2009-07", "2009-08", "2009-09", "2009-10",
-    "2009-11", "2009-12", "2010-01", "2010-02", "2010-03", "2010-04",
+    "2009-05",
+    "2009-06",
+    "2009-07",
+    "2009-08",
+    "2009-09",
+    "2009-10",
+    "2009-11",
+    "2009-12",
+    "2010-01",
+    "2010-02",
+    "2010-03",
+    "2010-04",
 )
 MONTHLY_VALIDATION_WINDOWS = {month: f"{month}-01 00:00:00" for month in MONTHS}
 BASE_OUTAGE_SEED = 42
@@ -89,8 +97,16 @@ ROBUSTNESS_VARIANTS = (
     ("outage_5pct", None, {"EDS": {"outage_probability_pct": 5.0}}),
     ("seed_44", 44, {}),
     ("seed_47", 47, {}),
-    ("noise_005", None, {"BESS": {"noisy": True, "noise": {"type": "gauss", "std_frac": 0.05, "std_kw": 0.0, "seed": 123}}}),
-    ("noise_010", None, {"BESS": {"noisy": True, "noise": {"type": "gauss", "std_frac": 0.10, "std_kw": 0.0, "seed": 123}}}),
+    (
+        "noise_005",
+        None,
+        {"BESS": {"noisy": True, "noise": {"type": "gauss", "std_frac": 0.05, "std_kw": 0.0, "seed": 123}}},
+    ),
+    (
+        "noise_010",
+        None,
+        {"BESS": {"noisy": True, "noise": {"type": "gauss", "std_frac": 0.10, "std_kw": 0.0, "seed": 123}}},
+    ),
 )
 
 
@@ -110,11 +126,7 @@ def _base_params(
         params = load_sized_parameters_from_artifact(parameters_json, sizing_artifact)
     else:
         params = load_sized_parameters(str(parameters_json))
-    params["time"].update(
-        horizon_hours=int(mesh["h"]),
-        timestep_1_min=int(mesh["t1"]),
-        timestep_2_min=int(mesh["t2"]),
-    )
+    params["time"].update(horizon_hours=int(mesh["h"]), timestep_1_min=int(mesh["t1"]), timestep_2_min=int(mesh["t2"]))
     if seed is not None:
         params["EDS"]["seed"] = int(seed)
     validate_time_mesh(params)
@@ -122,26 +134,19 @@ def _base_params(
 
 
 def _forecaster(name: str, params: dict):
-    scaling = {
-        "P_L_nom_kw": float(params["Load"]["Pmax_kw"]),
-        "P_PV_nom_kw": float(params["PV"]["Pmax_kw"]),
-    }
+    scaling = {"P_L_nom_kw": float(params["Load"]["Pmax_kw"]), "P_PV_nom_kw": float(params["PV"]["Pmax_kw"])}
     load_s, pv_s = load_series_scaled(scaling, LOAD_CSV, PV_CSV)
     if name == "ideal":
         return PerfectForecast(load_s, pv_s), "ideal"
     if name == "prototype":
         forecast = PrototypeForecast(
-            None, load_s, pv_s, float(params["PV"]["Pmax_kw"]),
-            float(params["Load"]["Pmax_kw"]), strategy="prefix",
+            None, load_s, pv_s, float(params["PV"]["Pmax_kw"]), float(params["Load"]["Pmax_kw"]), strategy="prefix"
         )
         return forecast, "prototype-prefix"
     if name == "lstm":
         from forecasting.get_forecasting import ForecastMPC
 
-        forecast = ForecastMPC(
-            {}, load_s, pv_s, float(params["PV"]["Pmax_kw"]),
-            float(params["Load"]["Pmax_kw"]),
-        )
+        forecast = ForecastMPC({}, load_s, pv_s, float(params["PV"]["Pmax_kw"]), float(params["Load"]["Pmax_kw"]))
         return forecast, "lstm"
     raise ValueError(f"Unknown controller: {name}")
 
@@ -159,8 +164,7 @@ def _audit_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     if solver_failures:
         reasons.append(f"{solver_failures} solver failure(s)")
 
-    overlap = max(value("max_simultaneous_ch_dis_kw"),
-                  value("max_plant_simultaneous_ch_dis_kw"))
+    overlap = max(value("max_simultaneous_ch_dis_kw"), value("max_plant_simultaneous_ch_dis_kw"))
     if overlap > 1e-6:
         reasons.append(f"charge/discharge overlap {overlap:.12g} kW")
 
@@ -205,7 +209,10 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
     n_iters = int(task["n_iters"])
     if controller == "stochastic":
         metrics = simulate_stochastic(
-            params, start, n_iters, out_dir,
+            params,
+            start,
+            n_iters,
+            out_dir,
             resolve_every_h=float(task.get("resolve_every_h", 24.0)),
             resume=bool(task.get("resume", True)),
         )
@@ -213,7 +220,11 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
     else:
         forecast, forecast_name = _forecaster(controller, params)
         metrics = simulate_mpc(
-            params, forecast, start, n_iters, out_dir,
+            params,
+            forecast,
+            start,
+            n_iters,
+            out_dir,
             forecaster_name=forecast_name,
             resume=bool(task.get("resume", True)),
         )
@@ -238,12 +249,7 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_progress(
-    path: Path,
-    stage: str,
-    completed: int,
-    total: int,
-    started: float,
-    recovered_rows: int = 0,
+    path: Path, stage: str, completed: int, total: int, started: float, recovered_rows: int = 0
 ) -> None:
     elapsed = time.perf_counter() - started
     eta = (elapsed / completed) * (total - completed) if completed else None
@@ -292,7 +298,7 @@ def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> 
     context = {
         "parameters_json": os.environ.get(PARAMETERS_ENV, PARAMS_JSON),
         "sizing_artifact": os.environ.get(SIZING_ARTIFACT_ENV),
-        "campaign_id": os.environ.get(CAMPAIGN_ID_ENV, "economic"),
+        "campaign_id": os.environ.get(CAMPAIGN_ID_ENV, "reference"),
     }
     for task in tasks:
         for key, value in context.items():
@@ -304,10 +310,7 @@ def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> 
     rows_by_case = {str(row["case_id"]): row for row in recovered}
     processed = 0
     if recovered:
-        print(
-            f"[resume] preserving {len(recovered)} row(s) from {summary_path.name}",
-            flush=True,
-        )
+        print(f"[resume] preserving {len(recovered)} row(s) from {summary_path.name}", flush=True)
 
     def record(task: dict[str, Any], result=None, error: Exception | None = None) -> None:
         nonlocal processed
@@ -322,8 +325,7 @@ def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> 
                 "combo": _mesh_tag(**task["mesh"]),
                 "campaign_id": task["campaign_id"],
                 "sizing_source_sha256": (
-                    sha256_file(Path(task["sizing_artifact"]))
-                    if task.get("sizing_artifact") else ""
+                    sha256_file(Path(task["sizing_artifact"])) if task.get("sizing_artifact") else ""
                 ),
                 **task.get("labels", {}),
                 "status": "error",
@@ -335,19 +337,8 @@ def run_tasks(tasks: list[dict[str, Any]], workers: int, summary_path: Path) -> 
         processed += 1
         rows = list(rows_by_case.values())
         _write_summary(summary_path, rows)
-        _write_progress(
-            state_path,
-            stage,
-            processed,
-            len(tasks),
-            started,
-            recovered_rows=len(recovered),
-        )
-        print(
-            f"[{processed}/{len(tasks)} | summary={len(rows)}] "
-            f"{task['case_id']}: {status}",
-            flush=True,
-        )
+        _write_progress(state_path, stage, processed, len(tasks), started, recovered_rows=len(recovered))
+        print(f"[{processed}/{len(tasks)} | summary={len(rows)}] {task['case_id']}: {status}", flush=True)
 
     if workers <= 1:
         for task in tasks:
@@ -413,14 +404,19 @@ def _candidate_table(
 
     df = summary.copy()
     required_columns = {
-        "combo", "h", "t1", "t2", "controller_name", "audit_pass",
-        "operation_total_cost", "avg_solve_time_s", "case_id",
+        "combo",
+        "h",
+        "t1",
+        "t2",
+        "controller_name",
+        "audit_pass",
+        "operation_total_cost",
+        "avg_solve_time_s",
+        "case_id",
     }
     missing_columns = sorted(required_columns.difference(df.columns))
     if missing_columns:
-        raise RuntimeError(
-            "Mesh summary is missing required columns: " + ", ".join(missing_columns)
-        )
+        raise RuntimeError("Mesh summary is missing required columns: " + ", ".join(missing_columns))
     for col in ("operation_total_cost", "avg_solve_time_s", "n_solve_fail"):
         if col in df:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -432,11 +428,7 @@ def _candidate_table(
     ].copy()
 
     available_controllers = set(df["controller_name"].unique())
-    missing_controllers = [
-        controller
-        for controller in required_controllers
-        if controller not in available_controllers
-    ]
+    missing_controllers = [controller for controller in required_controllers if controller not in available_controllers]
     if missing_controllers:
         details = []
         for controller in missing_controllers:
@@ -448,39 +440,26 @@ def _candidate_table(
             invalid_metrics = int(
                 (
                     (controller_rows["audit_pass"] == True)  # noqa: E712
-                    & (
-                        controller_rows["operation_total_cost"].isna()
-                        | controller_rows["avg_solve_time_s"].isna()
-                    )
+                    & (controller_rows["operation_total_cost"].isna() | controller_rows["avg_solve_time_s"].isna())
                 ).sum()
             )
             overlap = pd.to_numeric(
-                controller_rows.get(
-                    "max_simultaneous_ch_dis_kw",
-                    pd.Series(index=controller_rows.index, dtype=float),
-                ),
+                controller_rows.get("max_simultaneous_ch_dis_kw", pd.Series(index=controller_rows.index, dtype=float)),
                 errors="coerce",
             )
             detail = f"{controller} ({rejected} rejected by audit"
             if invalid_metrics:
                 detail += f"; {invalid_metrics} with incomplete metrics"
             if overlap.notna().any():
-                detail += (
-                    "; maximum charge/discharge overlap "
-                    f"{float(overlap.max()):.6g} kW"
-                )
+                detail += f"; maximum charge/discharge overlap {float(overlap.max()):.6g} kW"
             balance = pd.to_numeric(
                 controller_rows.get(
-                    "max_abs_power_balance_residual_kw",
-                    pd.Series(index=controller_rows.index, dtype=float),
+                    "max_abs_power_balance_residual_kw", pd.Series(index=controller_rows.index, dtype=float)
                 ),
                 errors="coerce",
             )
             if balance.notna().any():
-                detail += (
-                    "; maximum power-balance residual "
-                    f"{float(balance.max()):.6g} kW"
-                )
+                detail += f"; maximum power-balance residual {float(balance.max()):.6g} kW"
             details.append(detail + ")")
         raise RuntimeError(
             "Mesh simulations completed, but selection requires at least one audited "
@@ -490,23 +469,17 @@ def _candidate_table(
         )
 
     keys = ["combo", "h", "t1", "t2"]
-    by_controller = (
-        df.groupby([*keys, "controller_name"], as_index=False)
-        .agg(
-            mean_cost=("operation_total_cost", "mean"),
-            mean_solve_time_s=("avg_solve_time_s", "mean"),
-            runs=("case_id", "count"),
-        )
+    by_controller = df.groupby([*keys, "controller_name"], as_index=False).agg(
+        mean_cost=("operation_total_cost", "mean"),
+        mean_solve_time_s=("avg_solve_time_s", "mean"),
+        runs=("case_id", "count"),
     )
     required_set = set(required_controllers)
     coverage = by_controller.groupby("combo", as_index=False).agg(
-        controller_set=("controller_name", lambda values: set(values)),
-        minimum_runs=("runs", "min"),
+        controller_set=("controller_name", lambda values: set(values)), minimum_runs=("runs", "min")
     )
     complete_combos = coverage.loc[
-        coverage["controller_set"].eq(required_set)
-        & coverage["minimum_runs"].ge(expected_runs_per_controller),
-        "combo",
+        coverage["controller_set"].eq(required_set) & coverage["minimum_runs"].ge(expected_runs_per_controller), "combo"
     ]
     by_controller = by_controller[by_controller["combo"].isin(complete_combos)].copy()
     if by_controller.empty:
@@ -517,30 +490,19 @@ def _candidate_table(
 
     best_cost = by_controller.groupby("controller_name")["mean_cost"].transform("min")
     denominator = best_cost.abs().clip(lower=1e-12)
-    by_controller["relative_regret"] = (
-        (by_controller["mean_cost"] - best_cost) / denominator
-    ).clip(lower=0.0)
+    by_controller["relative_regret"] = ((by_controller["mean_cost"] - best_cost) / denominator).clip(lower=0.0)
 
-    grouped = (
-        by_controller.groupby(keys, as_index=False)
-        .agg(
-            mean_cost=("mean_cost", "mean"),
-            mean_solve_time_s=("mean_solve_time_s", "mean"),
-            mean_regret=("relative_regret", "mean"),
-            max_regret=("relative_regret", "max"),
-            controllers=("controller_name", "nunique"),
-            runs=("runs", "sum"),
-        )
+    grouped = by_controller.groupby(keys, as_index=False).agg(
+        mean_cost=("mean_cost", "mean"),
+        mean_solve_time_s=("mean_solve_time_s", "mean"),
+        mean_regret=("relative_regret", "mean"),
+        max_regret=("relative_regret", "max"),
+        controllers=("controller_name", "nunique"),
+        runs=("runs", "sum"),
     )
-    for value, prefix in (
-        ("mean_cost", "cost"),
-        ("mean_solve_time_s", "solve_time_s"),
-        ("relative_regret", "regret"),
-    ):
+    for value, prefix in (("mean_cost", "cost"), ("mean_solve_time_s", "solve_time_s"), ("relative_regret", "regret")):
         wide = by_controller.pivot(index=keys, columns="controller_name", values=value)
-        wide = wide.rename(
-            columns={controller: f"{prefix}_{controller}" for controller in wide.columns}
-        ).reset_index()
+        wide = wide.rename(columns={controller: f"{prefix}_{controller}" for controller in wide.columns}).reset_index()
         wide.columns.name = None
         grouped = grouped.merge(wide, on=keys, how="left", validate="one_to_one")
 
@@ -556,13 +518,10 @@ def _candidate_table(
     objectives = ["mean_regret", "max_regret", "mean_solve_time_s"]
     for idx, row in grouped.iterrows():
         dominated = (
-            grouped[objectives].le(row[objectives]).all(axis=1)
-            & grouped[objectives].lt(row[objectives]).any(axis=1)
+            grouped[objectives].le(row[objectives]).all(axis=1) & grouped[objectives].lt(row[objectives]).any(axis=1)
         ).any()
         grouped.loc[idx, "pareto"] = not bool(dominated)
-    return grouped.sort_values(
-        ["selection_score", "max_regret", "mean_regret", "mean_solve_time_s"]
-    )
+    return grouped.sort_values(["selection_score", "max_regret", "mean_regret", "mean_solve_time_s"])
 
 
 def _selection_artifact_is_current(data: dict[str, Any]) -> bool:
@@ -574,10 +533,7 @@ def _selection_artifact_is_current(data: dict[str, Any]) -> bool:
 
 
 def select_meshes(
-    summary_path: Path,
-    output_path: Path,
-    top_k: int,
-    expected_runs_per_controller: int = 1,
+    summary_path: Path, output_path: Path, top_k: int, expected_runs_per_controller: int = 1
 ) -> list[dict[str, int]]:
     candidates = _candidate_table(
         pd.read_csv(summary_path),
@@ -586,9 +542,7 @@ def select_meshes(
     )
     ordered = candidates[candidates["pareto"]].copy()
     if len(ordered) < top_k:
-        ordered = pd.concat(
-            [ordered, candidates[~candidates["combo"].isin(ordered["combo"])]]
-        )
+        ordered = pd.concat([ordered, candidates[~candidates["combo"].isin(ordered["combo"])]])
     selected = ordered.head(int(top_k))
     payload = {
         "operation_model_version": OPERATION_MODEL_VERSION,
@@ -606,24 +560,18 @@ def select_meshes(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     candidates.to_csv(output_path.with_suffix(".csv"), index=False)
-    return [
-        {"h": int(row.h), "t1": int(row.t1), "t2": int(row.t2)}
-        for row in selected.itertuples(index=False)
-    ]
+    return [{"h": int(row.h), "t1": int(row.t1), "t2": int(row.t2)} for row in selected.itertuples(index=False)]
 
 
 def write_mesh_effects(summary: pd.DataFrame, path: Path) -> None:
     valid = summary[summary.get("audit_pass", False) == True].copy()  # noqa: E712
     rows = []
     for factor in ("h", "t1", "t2"):
-        table = (
-            valid.groupby(["controller_name", factor], as_index=False)
-            .agg(
-                cases=("case_id", "count"),
-                mean_cost=("operation_total_cost", "mean"),
-                std_cost=("operation_total_cost", "std"),
-                mean_solve_time_s=("avg_solve_time_s", "mean"),
-            )
+        table = valid.groupby(["controller_name", factor], as_index=False).agg(
+            cases=("case_id", "count"),
+            mean_cost=("operation_total_cost", "mean"),
+            std_cost=("operation_total_cost", "std"),
+            mean_solve_time_s=("avg_solve_time_s", "mean"),
         )
         table.insert(1, "factor", factor)
         table.rename(columns={factor: "level"}, inplace=True)
@@ -641,7 +589,11 @@ def stage_mesh(args) -> pd.DataFrame:
                 for controller in EVALUATION_CONTROLLERS:
                     tasks.append(
                         _task(
-                            "mesh", controller, mesh, "2009-05-01", args.n_iters,
+                            "mesh",
+                            controller,
+                            mesh,
+                            "2009-05-01",
+                            args.n_iters,
                             root / controller / _mesh_tag(**mesh),
                             resume=not args.fresh,
                         )
@@ -662,10 +614,7 @@ def _selected_meshes(args) -> list[dict[str, int]]:
             data = None
     if not data or not _selection_artifact_is_current(data):
         return select_meshes(args.out_root / "01-mesh" / "summary.csv", path, args.top_k)
-    return [
-        {"h": int(x["h"]), "t1": int(x["t1"]), "t2": int(x["t2"])}
-        for x in data["selected"]
-    ]
+    return [{"h": int(x["h"]), "t1": int(x["t1"]), "t2": int(x["t2"])} for x in data["selected"]]
 
 
 def _refresh_baseline_costs(baseline: pd.DataFrame, out_root: Path) -> pd.DataFrame:
@@ -674,13 +623,10 @@ def _refresh_baseline_costs(baseline: pd.DataFrame, out_root: Path) -> pd.DataFr
         if not bool(row.get("audit_pass", False)):
             continue
         mesh = {"h": int(row["h"]), "t1": int(row["t1"]), "t2": int(row["t2"])}
-        case_dir = (
-            out_root / "01-mesh" / str(row["controller_name"]) / str(row["combo"])
-        )
+        case_dir = out_root / "01-mesh" / str(row["controller_name"]) / str(row["combo"])
         operation_path = operation_artifact_path(case_dir)
         cost_metrics = _operation_cost_metrics(
-            read_operation(operation_path),
-            _base_params(mesh, seed=MONTHLY_OUTAGE_SEEDS[MONTHS[0]]),
+            read_operation(operation_path), _base_params(mesh, seed=MONTHLY_OUTAGE_SEEDS[MONTHS[0]])
         )
         for key, value in cost_metrics.items():
             baseline.at[index, key] = value
@@ -688,10 +634,7 @@ def _refresh_baseline_costs(baseline: pd.DataFrame, out_root: Path) -> pd.DataFr
         if metrics_path.exists():
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             metrics.update(cost_metrics)
-            metrics_path.write_text(
-                json.dumps(metrics, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
     return baseline
 
 
@@ -710,24 +653,24 @@ def stage_seasonal(args) -> pd.DataFrame:
                     for controller in EVALUATION_CONTROLLERS:
                         tasks.append(
                             _task(
-                                "seasonal", controller, mesh, start, args.n_iters,
+                                "seasonal",
+                                controller,
+                                mesh,
+                                start,
+                                args.n_iters,
                                 root / month / controller / _mesh_tag(**mesh),
                                 labels={"month": month, "outage_seed": outage_seed},
-                                seed=outage_seed, resume=not args.fresh,
+                                seed=outage_seed,
+                                resume=not args.fresh,
                             )
                         )
 
     monthly = run_tasks(tasks, args.workers, root / "incremental_summary.csv")
     baseline_path = args.out_root / "01-mesh" / "summary.csv"
     if not baseline_path.exists():
-        raise FileNotFoundError(
-            "The annual mesh campaign reuses May from 01-mesh; run --stage mesh first"
-        )
+        raise FileNotFoundError("The annual mesh campaign reuses May from 01-mesh; run --stage mesh first")
     baseline = pd.read_csv(baseline_path)
-    baseline = baseline[
-        baseline["controller_name"].isin(EVALUATION_CONTROLLERS)
-        & baseline["combo"].notna()
-    ].copy()
+    baseline = baseline[baseline["controller_name"].isin(EVALUATION_CONTROLLERS) & baseline["combo"].notna()].copy()
     baseline = _refresh_baseline_costs(baseline, args.out_root)
     baseline["month"] = baseline_month
     baseline["outage_seed"] = MONTHLY_OUTAGE_SEEDS[baseline_month]
@@ -767,8 +710,7 @@ def _champion(args) -> dict[str, int]:
     if not data or not _selection_artifact_is_current(data):
         if not (args.out_root / "02-seasonal-mesh" / "summary.csv").exists():
             raise FileNotFoundError(
-                "Run --stage mesh and --stage annual-mesh with prototype and LSTM "
-                "before this stage"
+                "Run --stage mesh and --stage annual-mesh with prototype and LSTM before this stage"
             )
         champion = select_meshes(
             args.out_root / "02-seasonal-mesh" / "summary.csv",
@@ -797,7 +739,11 @@ def stage_forecast(args) -> pd.DataFrame:
         for controller in controllers:
             tasks.append(
                 _task(
-                    "forecast", controller, mesh, f"{month}-01", args.n_iters,
+                    "forecast",
+                    controller,
+                    mesh,
+                    f"{month}-01",
+                    args.n_iters,
                     root / month / controller,
                     labels={"month": month, "outage_seed": outage_seed},
                     seed=outage_seed,
@@ -817,10 +763,16 @@ def stage_recourse(args) -> pd.DataFrame:
             label = f"{window}_r{frequency}h"
             tasks.append(
                 _task(
-                    "recourse", "stochastic", mesh, start, args.n_iters,
+                    "recourse",
+                    "stochastic",
+                    mesh,
+                    start,
+                    args.n_iters,
                     root / label,
                     labels={"window": window, "seed": seed, "resolve_every_h": frequency},
-                    seed=seed, resolve_every_h=frequency, resume=not args.fresh,
+                    seed=seed,
+                    resolve_every_h=frequency,
+                    resume=not args.fresh,
                 )
             )
     return run_tasks(tasks, max(1, min(args.workers, 2)), root / "summary.csv")
@@ -836,10 +788,16 @@ def stage_robustness(args) -> pd.DataFrame:
             for controller in ("prototype", "stochastic"):
                 tasks.append(
                     _task(
-                        "robustness", controller, mesh, start, args.n_iters,
+                        "robustness",
+                        controller,
+                        mesh,
+                        start,
+                        args.n_iters,
                         root / window / variant / controller,
                         labels={"window": window, "variant": variant, "seed": seed},
-                        seed=seed, overrides=overrides, resume=not args.fresh,
+                        seed=seed,
+                        overrides=overrides,
+                        resume=not args.fresh,
                     )
                 )
     return run_tasks(tasks, max(1, min(args.workers, 2)), root / "summary.csv")
@@ -856,9 +814,7 @@ def _write_causal_pilot_comparison(summary: pd.DataFrame, path: Path) -> None:
     for controller in SELECTION_CONTROLLERS:
         frame = summary[summary["controller_name"] == controller]
         frame = frame[[*keys, *available]].drop_duplicates(keys, keep="last")
-        frame = frame.rename(
-            columns={column: f"{column}_{controller}" for column in available}
-        )
+        frame = frame.rename(columns={column: f"{column}_{controller}" for column in available})
         frames.append(frame)
     comparison = frames[0]
     for frame in frames[1:]:
@@ -869,9 +825,7 @@ def _write_causal_pilot_comparison(summary: pd.DataFrame, path: Path) -> None:
         prototype_cost = comparison["operation_total_cost_prototype"]
         comparison["delta_cost_lstm_minus_prototype"] = lstm_cost - prototype_cost
         comparison["delta_cost_pct_lstm_vs_prototype"] = (
-            100.0
-            * comparison["delta_cost_lstm_minus_prototype"]
-            / prototype_cost.abs().clip(lower=1e-12)
+            100.0 * comparison["delta_cost_lstm_minus_prototype"] / prototype_cost.abs().clip(lower=1e-12)
         )
     comparison.to_csv(path, index=False)
 
@@ -901,9 +855,7 @@ def stage_causal_pilot(args) -> pd.DataFrame:
                     )
                 )
     summary = run_tasks(tasks, args.workers, root / "summary.csv")
-    _write_causal_pilot_comparison(
-        summary, root / "comparison_lstm_prototype.csv"
-    )
+    _write_causal_pilot_comparison(summary, root / "comparison_lstm_prototype.csv")
     return summary
 
 
@@ -911,10 +863,7 @@ def stage_smoke(args) -> pd.DataFrame:
     root = args.out_root / "00-smoke"
     mesh = {"h": 12, "t1": 15, "t2": 120}
     tasks = [
-        _task(
-            "smoke", controller, mesh, "2009-05-01", args.smoke_iters,
-            root / controller, resume=not args.fresh,
-        )
+        _task("smoke", controller, mesh, "2009-05-01", args.smoke_iters, root / controller, resume=not args.fresh)
         for controller in EVALUATION_CONTROLLERS
     ]
     return run_tasks(tasks, 1, root / "summary.csv")
@@ -937,9 +886,7 @@ def write_manifest(args) -> None:
         previous_sizing = previous_inputs.get("sizing_artifact_sha256")
         previous_parameters = previous_inputs.get("parameters_sha256")
         if previous_id and previous_id != args.campaign_id:
-            raise RuntimeError(
-                f"Output root belongs to campaign {previous_id!r}, not {args.campaign_id!r}"
-            )
+            raise RuntimeError(f"Output root belongs to campaign {previous_id!r}, not {args.campaign_id!r}")
         if previous_sizing and previous_sizing != sizing_sha256:
             raise RuntimeError("Output root already contains results from another sizing artifact")
         if previous_parameters and previous_parameters != parameters_sha256:
@@ -981,6 +928,7 @@ def write_manifest(args) -> None:
             "5 min physical ramp reference independent of dt1",
             "terminal energy after the last interval not below measured initial energy",
             "BESS wear charged on bidirectional throughput instead of absolute net power",
+            "fixed export remuneration included in MPC, stochastic operation, and realized costs",
             "continuous realized load shedding consistent with the LP operational models",
             "last-resort discharge reduction when export and PV curtailment cannot absorb surplus",
             "strict realized power-balance, outage-isolation, and BESS-state audits",
@@ -1000,36 +948,30 @@ def write_manifest(args) -> None:
         },
         "planned_runs": {
             "causal_lstm_prototype_pilot": (
-                len(CAUSAL_PILOT_MESHES) * len(MONTHLY_VALIDATION_WINDOWS)
-                * len(SELECTION_CONTROLLERS)
+                len(CAUSAL_PILOT_MESHES) * len(MONTHLY_VALIDATION_WINDOWS) * len(SELECTION_CONTROLLERS)
             ),
-            "mesh": (
-                len(MESH_H) * len(MESH_T1) * len(MESH_T2)
-                * len(EVALUATION_CONTROLLERS)
-            ),
-            "annual_mesh_configurations": (
-                len(MESH_H) * len(MESH_T1) * len(MESH_T2)
-                * len(EVALUATION_CONTROLLERS)
-            ),
+            "mesh": (len(MESH_H) * len(MESH_T1) * len(MESH_T2) * len(EVALUATION_CONTROLLERS)),
+            "annual_mesh_configurations": (len(MESH_H) * len(MESH_T1) * len(MESH_T2) * len(EVALUATION_CONTROLLERS)),
             "annual_mesh_monthly_runs": (
-                len(MESH_H) * len(MESH_T1) * len(MESH_T2)
-                * len(EVALUATION_CONTROLLERS) * len(MONTHLY_VALIDATION_WINDOWS)
+                len(MESH_H)
+                * len(MESH_T1)
+                * len(MESH_T2)
+                * len(EVALUATION_CONTROLLERS)
+                * len(MONTHLY_VALIDATION_WINDOWS)
             ),
             "annual_mesh_incremental_runs_after_may": (
-                len(MESH_H) * len(MESH_T1) * len(MESH_T2)
+                len(MESH_H)
+                * len(MESH_T1)
+                * len(MESH_T2)
                 * len(EVALUATION_CONTROLLERS)
                 * (len(MONTHLY_VALIDATION_WINDOWS) - 1)
             ),
             "forecast": len(MONTHS) * len([x for x in args.forecast_controllers.split(",") if x]),
             "recourse": len(RECOURSE_WINDOWS) * 3,
-            "robustness": (
-                len(ROBUSTNESS_WINDOWS) * len(ROBUSTNESS_VARIANTS) * 2
-            ),
+            "robustness": (len(ROBUSTNESS_WINDOWS) * len(ROBUSTNESS_VARIANTS) * 2),
         },
     }
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def validate_campaign_definition(args) -> None:
@@ -1044,33 +986,9 @@ def validate_campaign_definition(args) -> None:
     expected_sizing = str(payload.get("sizing_artifact_sha256", ""))
     expected_parameters = str(payload.get("parameters_sha256", ""))
     if sha256_file(args.sizing_artifact) != expected_sizing:
-        raise RuntimeError(
-            f"Sizing artifact does not match campaign {args.campaign_id!r}: {args.sizing_artifact}"
-        )
+        raise RuntimeError(f"Sizing artifact does not match campaign {args.campaign_id!r}: {args.sizing_artifact}")
     if sha256_file(args.parameters) != expected_parameters:
-        raise RuntimeError(
-            f"Parameter file does not match campaign {args.campaign_id!r}: {args.parameters}"
-        )
-
-
-def parse_args(argv: Iterable[str] | None = None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stage",
-        choices=("smoke", "causal-pilot", "mesh", "annual-mesh", "seasonal", "forecast", "recourse", "robustness", "all"),
-        default="smoke",
-    )
-    parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
-    parser.add_argument("--parameters", type=Path, default=Path(PARAMS_JSON))
-    parser.add_argument("--sizing-artifact", type=Path)
-    parser.add_argument("--campaign-id", default="economic")
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--n-iters", type=int, default=DEFAULT_N_ITERS)
-    parser.add_argument("--smoke-iters", type=int, default=3)
-    parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--forecast-controllers", default="ideal,prototype,lstm")
-    parser.add_argument("--fresh", action="store_true", help="Ignore valid cached cases")
-    return parser.parse_args(argv)
+        raise RuntimeError(f"Parameter file does not match campaign {args.campaign_id!r}: {args.parameters}")
 
 
 def resolve_output_root(stage: str, out_root: Path) -> Path:
@@ -1080,8 +998,7 @@ def resolve_output_root(stage: str, out_root: Path) -> Path:
     return resolved
 
 
-def main(argv: Iterable[str] | None = None) -> None:
-    args = parse_args(argv)
+def _run_pipeline(args: SimpleNamespace) -> None:
     if args.workers < 1 or args.n_iters < 1 or args.smoke_iters < 1 or args.top_k < 1:
         raise ValueError("workers, n-iters, smoke-iters, and top-k must be positive")
     args.parameters = args.parameters.resolve()
@@ -1111,11 +1028,39 @@ def main(argv: Iterable[str] | None = None) -> None:
         "robustness": stage_robustness,
     }
     order = (
-        "causal-pilot", "mesh", "annual-mesh", "forecast", "recourse", "robustness"
-    ) if args.stage == "all" else (args.stage,)
+        ("causal-pilot", "mesh", "annual-mesh", "forecast", "recourse", "robustness")
+        if args.stage == "all"
+        else (args.stage,)
+    )
     for name in order:
         print(f"\n===== corrected pipeline: {name} =====", flush=True)
         stages[name](args)
+
+
+def main() -> None:
+    parameters = SIZING_ROOT / "parameters.json"
+    if not parameters.exists():
+        raise FileNotFoundError(f"Missing sizing parameters: {parameters}")
+
+    for sizing_case in SIZING_CASES:
+        artifact = SIZING_ROOT / sizing_case / "sizing_decision_variables.json"
+        if not artifact.exists():
+            raise FileNotFoundError(f"Missing sizing artifact: {artifact}")
+        print(f"\n=== with-degradation / {sizing_case} ===", flush=True)
+        args = SimpleNamespace(
+            stage=STAGE,
+            out_root=OPERATION_ROOT / sizing_case,
+            parameters=parameters,
+            sizing_artifact=artifact,
+            campaign_id=f"with-degradation-{sizing_case}",
+            workers=WORKERS,
+            n_iters=N_ITERS,
+            smoke_iters=SMOKE_ITERS,
+            top_k=TOP_K,
+            forecast_controllers=FORECAST_CONTROLLERS,
+            fresh=FRESH,
+        )
+        _run_pipeline(args)
 
 
 if __name__ == "__main__":

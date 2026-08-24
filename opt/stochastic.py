@@ -81,7 +81,17 @@ class Parameters:
 
         out["c_shed_per_kwh"] = float(costs["c_shed_per_kwh"])
         out["c_pv_curt_per_kwh"] = float(costs["c_pv_curt_per_kwh"])
+        out["c_export_per_kwh"] = float(costs.get("c_export_per_kwh", 0.0))
         out["tou_map"] = dict(costs.get("EDS", {}))
+        if out["c_export_per_kwh"] < 0.0:
+            raise ValueError("costs.c_export_per_kwh must be nonnegative")
+        if out["tou_map"]:
+            minimum_import_price = min(float(price) for price in out["tou_map"].values())
+            if out["c_export_per_kwh"] >= minimum_import_price:
+                raise ValueError(
+                    "The export tariff must remain below the minimum import tariff while "
+                    "simultaneous grid import/export is represented by a continuous LP"
+                )
 
         if "bess_degradation_per_kwh" in costs:
             out["c_bess_deg_per_kwh"] = float(costs["bess_degradation_per_kwh"])
@@ -382,6 +392,7 @@ class OnGridStochasticOperation:
         m.c_pv_curt = Param(initialize=float(self.param.data["c_pv_curt_per_kwh"]))
         m.c_deg = Param(initialize=float(self.param.data["c_bess_deg_per_kwh"]))
         m.c_grid = Param(m.T, initialize=lambda _, t: float(tdata["price_map"][t]))
+        m.c_export = Param(initialize=float(self.param.data["c_export_per_kwh"]))
 
         m.Load_kw = Param(m.T, m.S, initialize=lambda _, t, s: float(sdata["p_load_kw"][(t, s)]))
         m.PV_kw = Param(m.T, m.S, initialize=lambda _, t, s: float(sdata["p_pv_kw"][(t, s)]))
@@ -572,6 +583,7 @@ class OnGridStochasticOperation:
                     _m.c_shed * _m.Load_kw[t, s] * _m.X_L[t, s, c]
                     + _m.c_pv_curt * _m.PV_kw[t, s] * _m.X_PV[t, s, c]
                     + _m.c_grid[t] * _m.P_gin[t, s, c]
+                    - _m.c_export * _m.P_gout[t, s, c]
                     + _m.c_deg * (_m.P_ch[t] + _m.P_dis[t])
                 )
                 + eps * (_m.X_L[t, s, c] + _m.X_PV[t, s, c])

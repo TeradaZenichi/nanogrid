@@ -26,8 +26,8 @@ DEFAULT_PV_CSV = "data/pv_5min_test.csv"
 
 DEFAULT_SOLVER_OPTS = {"time_limit": 120, "threads": 1, "mip_gap": 0.01}
 DEFAULT_STOCH_SOLVER_OPTS = {"time_limit": 1200, "threads": 8, "mip_gap": 0.01}
-OPERATION_MODEL_VERSION = "2026.08-continuous-shed-strict-balance-v6"
-COST_ACCOUNTING_VERSION = "realized-grid-reliability-plus-throughput-v1"
+OPERATION_MODEL_VERSION = "2026.08-export-revenue-v7"
+COST_ACCOUNTING_VERSION = "realized-net-grid-reliability-plus-throughput-v2"
 CACHE_COMPATIBLE_OPERATION_MODELS = {
     "2026.08-continuous-shed-strict-balance-v5": (
         "v6 adds a fail-only on-grid discharge correction after export and "
@@ -136,7 +136,18 @@ def _operation_cost_metrics(df: pd.DataFrame, params: dict) -> Dict[str, Any]:
     """Summarize realized plant costs, including marginal BESS wear."""
     if df.empty or "cost_total" not in df.columns:
         return {}
-    grid_reliability = float(pd.to_numeric(df["cost_total"], errors="coerce").sum())
+    net_grid_reliability = float(pd.to_numeric(df["cost_total"], errors="coerce").sum())
+    zero_cost = pd.Series(0.0, index=df.index)
+    import_cost = float(pd.to_numeric(df.get("cost_grid", zero_cost), errors="coerce").sum())
+    export_revenue = float(
+        pd.to_numeric(df.get("revenue_export", zero_cost), errors="coerce").sum()
+    )
+    shedding_cost = float(
+        pd.to_numeric(df.get("cost_shed", zero_cost), errors="coerce").sum()
+    )
+    curtailment_cost = float(
+        pd.to_numeric(df.get("cost_curt", zero_cost), errors="coerce").sum()
+    )
     required = ("P_bess_charge_mag_kw", "P_bess_discharge_kw")
     missing = [column for column in required if column not in df.columns]
     if missing:
@@ -150,10 +161,16 @@ def _operation_cost_metrics(df: pd.DataFrame, params: dict) -> Dict[str, Any]:
     throughput_kwh = float((charge + discharge).sum() * dt_h)
     c_deg = float(params.get("costs", {}).get("bess_degradation_per_kwh", 0.0))
     wear = float(c_deg * throughput_kwh)
-    total = float(grid_reliability + wear)
+    total = float(net_grid_reliability + wear)
     return {
         "cost_accounting_version": COST_ACCOUNTING_VERSION,
-        "operation_grid_reliability_cost": grid_reliability,
+        "operation_grid_reliability_cost": net_grid_reliability,
+        "operation_net_grid_reliability_cost": net_grid_reliability,
+        "operation_grid_import_cost": import_cost,
+        "operation_export_revenue": export_revenue,
+        "operation_net_grid_cost": import_cost - export_revenue,
+        "operation_load_shedding_cost": shedding_cost,
+        "operation_pv_curtailment_cost": curtailment_cost,
         "operation_bess_throughput_kwh": throughput_kwh,
         "operation_wear_cost": wear,
         "operation_total_cost": total,

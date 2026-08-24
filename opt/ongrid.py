@@ -56,7 +56,17 @@ class Parameters:
 
         out["c_shed_per_kwh"] = float(costs["c_shed_per_kwh"])
         out["c_pv_curt_per_kwh"] = float(costs["c_pv_curt_per_kwh"])
+        out["c_export_per_kwh"] = float(costs.get("c_export_per_kwh", 0.0))
         out["tou_map"] = dict(costs.get("EDS", {}))
+        if out["c_export_per_kwh"] < 0.0:
+            raise ValueError("costs.c_export_per_kwh must be nonnegative")
+        if out["tou_map"]:
+            minimum_import_price = min(float(price) for price in out["tou_map"].values())
+            if out["c_export_per_kwh"] >= minimum_import_price:
+                raise ValueError(
+                    "The export tariff must remain below the minimum import tariff while "
+                    "simultaneous grid import/export is represented by a continuous LP"
+                )
 
         if "bess_degradation_per_kwh" in costs:
             out["c_bess_deg_per_kwh"] = float(costs["bess_degradation_per_kwh"])
@@ -173,11 +183,13 @@ class Grid:
     def __init__(self, params: Parameters):
         self.p_imp_cap_kw = max(0.0, float(params.data["P_grid_import_cap_kw"]))
         self.p_exp_cap_kw = max(0.0, float(params.data["P_grid_export_cap_kw"]))
+        self.c_export_per_kwh = max(0.0, float(params.data["c_export_per_kwh"]))
 
     def build(self, model, price_map: Dict[datetime, float]) -> None:
         model.P_imp_cap = Param(initialize=self.p_imp_cap_kw)
         model.P_exp_cap = Param(initialize=self.p_exp_cap_kw)
         model.c_grid = Param(model.T, initialize=lambda _, t: price_map[t])
+        model.c_export = Param(initialize=self.c_export_per_kwh)
         model.P_gin = Var(model.T, model.C, domain=NonNegativeReals)
         model.P_gout = Var(model.T, model.C, domain=NonNegativeReals)
 
@@ -478,6 +490,7 @@ class OnGridMPC:
                     m.c_shed * m.Load_kw[t] * m.X_L[t, c]
                     + m.c_pv_curt * m.PV_kw[t] * m.X_PV[t, c]
                     + m.c_grid[t] * m.P_gin[t, c]
+                    - m.c_export * m.P_gout[t, c]
                     + m.c_deg * (m.P_ch[t, c] + m.P_dis[t, c])
                 )
                 + eps * (m.X_L[t, c] + m.X_PV[t, c])

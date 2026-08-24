@@ -129,7 +129,7 @@ class GridEnv:
         """Parse BESS, grid caps, noise, RNGs, and costs from params."""
         B = self.p.get("BESS", {})
         E_nom = float(B.get("Emax_kwh", self.p.get("E_nom_kwh", 0.0)) or 0.0)
-        E_nom = max(E_nom, 1e-9)
+        E_nom = max(E_nom, 0.0)
         DoD = float(B.get("DoD_frac", self.p.get("DoD_frac", 1.0)))
         DoD = min(max(0.0, DoD), 1.0)
         soc_min = 1.0 - DoD
@@ -186,6 +186,7 @@ class GridEnv:
         self.costs = {
             "c_shed": float(C.get("c_shed_per_kwh", 0.0)),
             "c_curt": float(C.get("c_pv_curt_per_kwh", 0.0)),
+            "c_export": float(C.get("c_export_per_kwh", 0.0)),
             "TOU": C.get("EDS", {}) if isinstance(C.get("EDS", {}), dict) else {},
         }
 
@@ -567,7 +568,7 @@ class GridEnv:
 
         E_next = self.E_meas + self.dt_h * (self.bess["eta_c"] * Pch - (1.0 / self.bess["eta_d"]) * Pdis)
         E_next = min(max(E_next, self.bess["E_min"]), self.bess["E_max"])
-        soc_pct = 100.0 * (E_next / self.bess["E_nom"])
+        soc_pct = 100.0 * (E_next / self.bess["E_nom"]) if self.bess["E_nom"] > 0.0 else 0.0
         if self.clamp_soc_pct:
             soc_pct = min(max(soc_pct, 0.0), 100.0)
 
@@ -577,12 +578,14 @@ class GridEnv:
             tou = float(self.costs["TOU"].get(key, 0.0))
 
         energy_grid_kwh = Pgrid_in * self.dt_h
+        energy_export_kwh = Pgrid_out * self.dt_h
         energy_shed_kwh = shed * self.dt_h
         energy_curt_kwh = curt * self.dt_h
         cost_grid = tou * energy_grid_kwh
+        revenue_export = self.costs["c_export"] * energy_export_kwh
         cost_shed = self.costs["c_shed"] * energy_shed_kwh
         cost_curt = self.costs["c_curt"] * energy_curt_kwh
-        cost_total = cost_grid + cost_shed + cost_curt
+        cost_total = cost_grid - revenue_export + cost_shed + cost_curt
 
         row = {
             "timestamp": pd.Timestamp(self.timestamp),
@@ -599,7 +602,8 @@ class GridEnv:
             "Residual_kw": residual,
             "E_kwh": E_next, "SoC_pct": soc_pct,
             "TOU_cperkwh": tou,
-            "cost_grid": cost_grid, "cost_shed": cost_shed, "cost_curt": cost_curt, "cost_total": cost_total,
+            "cost_grid": cost_grid, "revenue_export": revenue_export,
+            "cost_shed": cost_shed, "cost_curt": cost_curt, "cost_total": cost_total,
             "obj": (None if obj is None else float(obj)),
             "mode": self.mode,
             "clamps": clamps,

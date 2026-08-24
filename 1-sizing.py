@@ -1,8 +1,7 @@
-"""Compare economic and resilience-oriented PV/BESS sizing policies."""
+"""Run the paper's PV/BESS sizing sensitivity campaign."""
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import sys
@@ -11,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import matplotlib
@@ -22,14 +22,14 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from matplotlib.backends.backend_pdf import PdfPages
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from sizing import MicrogridDesign
 
 
 PARAMETERS_PATH = ROOT / "data" / "parameters.json"
-RESULTS_ROOT = ROOT / "outputs" / "sizing-resilience"
+RESULTS_ROOT = ROOT / "outputs" / "sizing-sweep"
 LOAD_TRAIN_PATH = ROOT / "data" / "load_5min_train.csv"
 LOAD_TEST_PATH = ROOT / "data" / "load_5min_test.csv"
 LOAD_PROTOTYPES_PATH = ROOT / "data" / "sizing" / "prototypes_load_dtw_all_train.csv"
@@ -43,13 +43,37 @@ class Case:
     case_id: str
     label: str
     service_fraction: float
+    pv_credit_mode: str = "none"
 
 
 CASES = (
     Case("economic", "Economic sizing", 0.0),
     Case("critical_50", "Critical-load resilience", 0.5),
     Case("full_100", "Full-load resilience", 1.0),
+    Case("full_100_solar", "Full-load resilience with PV credit", 1.0, "daylight"),
 )
+
+DEGRADATION_SWEEP = (
+    ("with-degradation", {}),
+    (
+        "without-degradation",
+        {
+            "sizing": {
+                "bess_calendar_fade_per_year": 0.0,
+                "bess_cyclic_fade_per_kwh": 0.0,
+                "pv_degradation_year1_frac": 0.0,
+                "pv_degradation_linear_frac": 0.0,
+            }
+        },
+    ),
+)
+SELECTED_CASES = ("economic", "critical_50", "full_100")
+TIME_LIMIT_SECONDS = 7200.0
+THREADS = 8
+SOLVER = "gurobi"
+TEE = False
+FORCE = True
+DRY_RUN = False
 
 
 def _utc_now() -> str:
@@ -127,13 +151,7 @@ def _build_sizing_inputs(train_tail: dict[str, Any]) -> tuple[pd.DataFrame, pd.D
     slots = int(load["slot"].nunique())
     zero_pv_cluster = int(pv["cluster"].max()) + 1
     zero_pv = pd.DataFrame(
-        {
-            "group": "PV_STRESS",
-            "split": "train",
-            "cluster": zero_pv_cluster,
-            "slot": range(slots),
-            "value": 0.0,
-        }
+        {"group": "PV_STRESS", "split": "train", "cluster": zero_pv_cluster, "slot": range(slots), "value": 0.0}
     )
     pv = pd.concat([pv, zero_pv], ignore_index=True)
 
@@ -155,13 +173,7 @@ def _build_sizing_inputs(train_tail: dict[str, Any]) -> tuple[pd.DataFrame, pd.D
         values = _aggregate_day(LOAD_TRAIN_PATH, day, slots)
         stress_rows.append(
             pd.DataFrame(
-                {
-                    "group": "LOAD_STRESS",
-                    "split": "train",
-                    "cluster": cluster,
-                    "slot": range(slots),
-                    "value": values,
-                }
+                {"group": "LOAD_STRESS", "split": "train", "cluster": cluster, "slot": range(slots), "value": values}
             )
         )
         row = {column: None for column in joint.columns}
@@ -195,7 +207,37 @@ def _build_sizing_inputs(train_tail: dict[str, Any]) -> tuple[pd.DataFrame, pd.D
     return pv, load, joint, metadata
 
 
-def _effective_config(base: dict[str, Any], case: Case, train_tail: dict[str, Any]) -> dict[str, Any]:
+def _pv_resilience_credit(pv: pd.DataFrame, outage_hours: float) -> dict[str, Any]:
+    train = pv[pv["split"] == "train"].copy()
+    if train.empty:
+        return {"cluster": None, "peak_factor": 0.0, "energy_factor": 0.0, "window_slots": 0}
+
+    slots = int(train["slot"].nunique())
+    window = max(1, int(round(outage_hours * slots / 24.0)))
+    best: dict[str, Any] | None = None
+    for cluster, group in train.groupby("cluster", sort=False):
+        profile = group.sort_values("slot")["value"].astype(float).reindex(range(slots))
+        if profile.isna().any():
+            continue
+        peak_factor = float(profile.max())
+        energy_factor = float(profile.rolling(window, min_periods=window).sum().max() * (24.0 / slots))
+        candidate = {
+            "cluster": int(cluster),
+            "peak_factor": peak_factor,
+            "energy_factor": energy_factor,
+            "window_slots": window,
+        }
+        if best is None or candidate["energy_factor"] > best["energy_factor"]:
+            best = candidate
+
+    if best is None:
+        return {"cluster": None, "peak_factor": 0.0, "energy_factor": 0.0, "window_slots": window}
+    return best
+
+
+def _effective_config(
+    base: dict[str, Any], case: Case, train_tail: dict[str, Any], pv_credit: dict[str, Any]
+) -> dict[str, Any]:
     config = deepcopy(base)
     campaign = config.get("resilience_sizing", {})
     sizing = config.setdefault("sizing", {})
@@ -204,6 +246,10 @@ def _effective_config(base: dict[str, Any], case: Case, train_tail: dict[str, An
     sizing["resilience_peak_load_kw"] = float(config["Load"]["Pmax_kw"])
     sizing["resilience_outage_energy_kwh"] = float(train_tail["maximum_outage_energy_kwh"])
     sizing["E_BESS_size_max_kwh"] = float(campaign.get("E_BESS_size_max_kwh", 25.0))
+    if case.pv_credit_mode == "daylight":
+        sizing["resilience_pv_peak_factor"] = float(pv_credit["peak_factor"])
+        sizing["resilience_pv_energy_factor"] = float(pv_credit["energy_factor"])
+        sizing["resilience_pv_credit_cluster"] = int(pv_credit["cluster"])
     return config
 
 
@@ -247,9 +293,7 @@ def _expected_day_metrics(design: MicrogridDesign, year: int) -> dict[str, float
                 totals["operating_cost_usd"] += weight * stage_cost
                 if str(c) != "c0":
                     outage_shed += weight * shed
-    totals["conditional_outage_shed_kwh"] = (
-        outage_shed / outage_probability if outage_probability > 0.0 else 0.0
-    )
+    totals["conditional_outage_shed_kwh"] = outage_shed / outage_probability if outage_probability > 0.0 else 0.0
     return totals
 
 
@@ -298,24 +342,44 @@ def _service_audit(
 
 
 def _tail_adequacy(
-    config: dict[str, Any], case: Case, capacity_by_year: dict[int, float], tails: dict[str, Any]
+    config: dict[str, Any],
+    case: Case,
+    capacity_by_year: dict[int, float],
+    tails: dict[str, Any],
+    pv_size_kw: float,
+    pv_credit: dict[str, Any],
 ) -> dict[str, Any]:
     crate = float(config["BESS"]["crate_per_h"])
     dod = float(config["BESS"]["DoD_frac"])
     eta_d = float(config["BESS"]["eta_d"])
+    sizing = config.get("sizing", {})
+    pv_year1 = float(sizing.get("pv_degradation_year1_frac", config["PV"].get("degradation_year1_frac", 0.01)))
+    pv_linear = float(sizing.get("pv_degradation_linear_frac", config["PV"].get("degradation_linear_frac", 0.004)))
+    pv_peak_factor = float(pv_credit.get("peak_factor", 0.0))
+    pv_energy_factor = float(pv_credit.get("energy_factor", 0.0))
+
+    def pv_retention(year: int) -> float:
+        if year <= 1:
+            return 1.0
+        return max(0.0, (1.0 - pv_year1) * ((1.0 - pv_linear) ** (year - 1)))
+
     years = sorted(capacity_by_year)
     audits: dict[str, Any] = {}
     for split, tail in tails.items():
         rows = {}
         for year in (years[0], years[-1]):
             capacity = capacity_by_year[year]
-            power_margin = crate * capacity - case.service_fraction * tail["night_peak_kw"]
+            retention = pv_retention(year)
+            pv_power = pv_size_kw * pv_peak_factor * retention
+            pv_energy = pv_size_kw * pv_energy_factor * retention
+            power_margin = crate * capacity + pv_power - case.service_fraction * tail["night_peak_kw"]
             energy_margin = (
-                dod * eta_d * capacity
-                - case.service_fraction * tail["maximum_outage_energy_kwh"]
+                dod * eta_d * capacity + pv_energy - case.service_fraction * tail["maximum_outage_energy_kwh"]
             )
             rows[str(year)] = {
                 "available_capacity_kwh": capacity,
+                "pv_power_credit_kw": pv_power,
+                "pv_energy_credit_kwh": pv_energy,
                 "power_margin_kw": power_margin,
                 "energy_margin_kwh": energy_margin,
                 "passes": power_margin >= -1e-7 and energy_margin >= -1e-7,
@@ -325,10 +389,17 @@ def _tail_adequacy(
 
 
 def _run_case(
-    base: dict[str, Any], case: Case, pv: pd.DataFrame, load: pd.DataFrame,
-    joint: pd.DataFrame, stress: dict[str, Any], tails: dict[str, Any], args: argparse.Namespace
+    base: dict[str, Any],
+    case: Case,
+    pv: pd.DataFrame,
+    load: pd.DataFrame,
+    joint: pd.DataFrame,
+    stress: dict[str, Any],
+    tails: dict[str, Any],
+    pv_credit: dict[str, Any],
+    args: SimpleNamespace,
 ) -> dict[str, Any]:
-    config = _effective_config(base, case, tails["train"])
+    config = _effective_config(base, case, tails["train"], pv_credit)
     effective_hash = _canonical_hash({"config": config, "stress": stress, "tails": tails})
     case_dir = args.results_root / case.case_id
     result_path = case_dir / "sizing_decision_variables.json"
@@ -366,21 +437,12 @@ def _run_case(
             "constraints": int(model.nconstraints()),
         }
         solved = design.optimize(
-            tee=args.tee,
-            time_limit=args.time_limit,
-            threads=args.threads,
-            solver_name=args.solver,
+            tee=args.tee, time_limit=args.time_limit, threads=args.threads, solver_name=args.solver
         )
         status = str(solved.solver.status)
         termination = str(solved.solver.termination_condition)
-        loaded = status.lower() == "ok" and termination.lower() in {
-            "optimal", "locallyoptimal", "feasible"
-        }
-        result.update(
-            solver_status=status,
-            termination_condition=termination,
-            has_loaded_solution=loaded,
-        )
+        loaded = status.lower() == "ok" and termination.lower() in {"optimal", "locallyoptimal", "feasible"}
+        result.update(solver_status=status, termination_condition=termination, has_loaded_solution=loaded)
         if not loaded:
             return result
 
@@ -402,27 +464,17 @@ def _run_case(
                 "E_BESS_init_by_year_kwh": out["E_BESS_init_by_year_kwh"],
                 "last_year_retention_fraction": capacity[years[-1]] / bess_size,
             },
-            costs={
-                "CAPEX_usd": out["CAPEX"],
-                "NPV_OPEX_usd": out["NPV_OPEX"],
-                "Objective_usd": out["Objective"],
-            },
+            costs={"CAPEX_usd": out["CAPEX"], "NPV_OPEX_usd": out["NPV_OPEX"], "Objective_usd": out["Objective"]},
             year_1_metrics=_expected_day_metrics(design, years[0]),
             last_year_metrics=_expected_day_metrics(design, years[-1]),
             service_audit={
-                "year_1": _service_audit(
-                    design, years[0], set(stress["load_clusters"]), cluster_map
-                ),
-                "last_year": _service_audit(
-                    design, years[-1], set(stress["load_clusters"]), cluster_map
-                ),
+                "year_1": _service_audit(design, years[0], set(stress["load_clusters"]), cluster_map),
+                "last_year": _service_audit(design, years[-1], set(stress["load_clusters"]), cluster_map),
             },
-            tail_adequacy=_tail_adequacy(config, case, capacity, tails),
+            tail_adequacy=_tail_adequacy(config, case, capacity, tails, float(out["P_hat_PV_kw"] or 0.0), pv_credit),
             model_audit={
                 "cycle_closure_max_abs_kwh": out["BESS_cycle_closure_max_abs_kwh"],
-                "simultaneous_charge_discharge_max_kw": (
-                    out["BESS_simultaneous_charge_discharge_max_kw"]
-                ),
+                "simultaneous_charge_discharge_max_kw": (out["BESS_simultaneous_charge_discharge_max_kw"]),
                 "resilience_power_margin_by_year_kw": out["resilience_power_margin_by_year_kw"],
                 "resilience_energy_margin_by_year_kwh": out["resilience_energy_margin_by_year_kwh"],
             },
@@ -478,9 +530,7 @@ def _configure_gulliver() -> str:
         raise FileNotFoundError(f"Gulliver font not found: {GULLIVER_PATH}")
     font_manager.fontManager.addfont(str(GULLIVER_PATH))
     family = font_manager.FontProperties(fname=str(GULLIVER_PATH)).get_name()
-    plt.rcParams.update(
-        {"font.family": family, "font.sans-serif": [family], "pdf.fonttype": 42, "ps.fonttype": 42}
-    )
+    plt.rcParams.update({"font.family": family, "font.sans-serif": [family], "pdf.fonttype": 42, "ps.fonttype": 42})
     return family
 
 
@@ -517,7 +567,11 @@ def _save_outputs(root: Path, results: list[dict[str, Any]], campaign: dict[str,
         for result in solved:
             capacity = result["lifetime"]["E_BESS_year_kwh"]
             years = sorted(int(year) for year in capacity)
-            ax.plot(years, [capacity[str(y)] if str(y) in capacity else capacity[y] for y in years], label=result["case_label"])
+            ax.plot(
+                years,
+                [capacity[str(y)] if str(y) in capacity else capacity[y] for y in years],
+                label=result["case_label"],
+            )
         ax.set_xlabel("Planning year", fontsize=9)
         ax.set_ylabel("Available BESS capacity (kWh)", fontsize=9)
         ax.grid(alpha=0.25)
@@ -527,22 +581,7 @@ def _save_outputs(root: Path, results: list[dict[str, Any]], campaign: dict[str,
         plt.close(fig)
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--parameters", type=Path, default=PARAMETERS_PATH)
-    parser.add_argument("--results-root", type=Path, default=RESULTS_ROOT)
-    parser.add_argument("--case", action="append", choices=[case.case_id for case in CASES])
-    parser.add_argument("--time-limit", type=float, default=7200.0)
-    parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--solver", default=None)
-    parser.add_argument("--tee", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = _parse_args()
+def _run_campaign(args: SimpleNamespace) -> int:
     args.parameters = args.parameters.resolve()
     args.results_root = args.results_root.resolve()
     base = json.loads(args.parameters.read_text(encoding="utf-8"))
@@ -553,6 +592,7 @@ def main() -> int:
         "test": _tail_statistics(LOAD_TEST_PATH, pmax_kw, outage_hours),
     }
     pv, load, joint, stress = _build_sizing_inputs(tails["train"])
+    pv_credit = _pv_resilience_credit(pv, outage_hours)
     selected = [case for case in CASES if not args.case or case.case_id in args.case]
     campaign = {
         "schema_version": 1,
@@ -571,7 +611,7 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     for index, case in enumerate(selected, start=1):
         print(f"[{index}/{len(selected)}] {case.case_id}: solving", flush=True)
-        result = _run_case(base, case, pv, load, joint, stress, tails, args)
+        result = _run_case(base, case, pv, load, joint, stress, tails, pv_credit, args)
         results.append(result)
         _save_outputs(args.results_root, results, campaign)
         print(
@@ -583,6 +623,37 @@ def main() -> int:
     _save_outputs(args.results_root, results, campaign)
     print((args.results_root / "summary.csv").as_posix())
     print((args.results_root / "sizing_resilience_report.pdf").as_posix())
+    return 0
+
+
+def _write_parameters(overrides: dict[str, Any], destination: Path) -> None:
+    parameters = json.loads(PARAMETERS_PATH.read_text(encoding="utf-8"))
+    for section, values in overrides.items():
+        parameters.setdefault(section, {}).update(values)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(parameters, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def main() -> int:
+    for degradation_name, overrides in DEGRADATION_SWEEP:
+        degradation_root = RESULTS_ROOT / degradation_name
+        parameters = degradation_root / "parameters.json"
+        _write_parameters(overrides, parameters)
+        print(f"\n=== {degradation_name} ===", flush=True)
+        args = SimpleNamespace(
+            parameters=parameters,
+            results_root=degradation_root,
+            case=list(SELECTED_CASES),
+            time_limit=TIME_LIMIT_SECONDS,
+            threads=THREADS,
+            solver=SOLVER,
+            tee=TEE,
+            force=FORCE,
+            dry_run=DRY_RUN,
+        )
+        status = _run_campaign(args)
+        if status:
+            return status
     return 0
 
 
