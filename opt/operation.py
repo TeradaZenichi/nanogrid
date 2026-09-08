@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import math
@@ -26,9 +27,16 @@ DEFAULT_PV_CSV = "data/pv_5min_test.csv"
 
 DEFAULT_SOLVER_OPTS = {"time_limit": 120, "threads": 1, "mip_gap": 0.01}
 DEFAULT_STOCH_SOLVER_OPTS = {"time_limit": 1200, "threads": 8, "mip_gap": 0.01}
-OPERATION_MODEL_VERSION = "2026.08-export-revenue-v7"
+OPERATION_MODEL_VERSION = "2026.09-evaluation-terminal-closure-v8"
 COST_ACCOUNTING_VERSION = "realized-net-grid-reliability-plus-throughput-v2"
+PARAMETER_FINGERPRINT_VERSION = "portable-sizing-provenance-v2"
+IN_PROGRESS_MARKER = ".operation_in_progress.json"
 CACHE_COMPATIBLE_OPERATION_MODELS = {
+    "2026.08-export-revenue-v7": (
+        "v8 removes the redundant generic terminal-energy constraint when "
+        "an exact finite-evaluation terminal target is active; completed v7 "
+        "runs without solver failures are unchanged"
+    ),
     "2026.08-continuous-shed-strict-balance-v5": (
         "v6 adds a fail-only on-grid discharge correction after export and "
         "PV curtailment are exhausted"
@@ -52,14 +60,31 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def parameter_fingerprint(params: dict) -> str:
-    """Stable hash used to invalidate cached operational artifacts."""
-    payload = json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Portable hash used to invalidate cached operational artifacts.
+
+    The sizing file hashes remain part of the payload. Only machine-local source
+    paths are removed so artifacts copied between workstations retain identity.
+    """
+    portable = json.loads(json.dumps(params, ensure_ascii=False))
+    sizing = portable.get("sizing_case_applied")
+    if isinstance(sizing, dict):
+        sizing.pop("source", None)
+        sizing.pop("parameters_source", None)
+    payload = json.dumps(
+        portable, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _run_fingerprint(run_config: dict) -> str:
     """Stable identity for simulation settings that are not model parameters."""
-    return parameter_fingerprint(run_config)
+    normalized = dict(run_config)
+    if not bool(normalized.get("close_evaluation_energy", False)):
+        # Preserve compatibility with all stochastic caches created before the
+        # finite-evaluation closure option existed.
+        normalized.pop("close_evaluation_energy", None)
+        normalized.pop("terminal_closure_lookahead_h", None)
+    return parameter_fingerprint(normalized)
 
 
 def validate_time_mesh(params: dict) -> None:
@@ -105,10 +130,18 @@ def validate_sized_system(params: dict) -> None:
 def _prepare_case_dir(params: dict, out_dir: Path, run_config: dict) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        out_dir / IN_PROGRESS_MARKER,
+        {
+            "started_at": pd.Timestamp.now().isoformat(),
+            "run_fingerprint_sha256": _run_fingerprint(run_config),
+        },
+    )
     payload = dict(params)
     payload["_operation_model"] = {
         "version": OPERATION_MODEL_VERSION,
         "parameter_fingerprint_sha256": parameter_fingerprint(params),
+        "parameter_fingerprint_version": PARAMETER_FINGERPRINT_VERSION,
     }
     payload["_operation_run"] = {
         **run_config,
@@ -256,6 +289,7 @@ def _finish_case(env: GridEnv, out_dir: Path, metrics: Dict[str, Any]) -> Dict[s
     metrics.update(
         operation_model_version=OPERATION_MODEL_VERSION,
         parameter_fingerprint_sha256=parameter_fingerprint(env.p),
+        parameter_fingerprint_version=PARAMETER_FINGERPRINT_VERSION,
         sizing_case=sizing['case'],
         sizing_operation_year=int(sizing['operation_year']),
         sizing_source_sha256=sizing['source_sha256'],
@@ -291,6 +325,7 @@ def _finish_case(env: GridEnv, out_dir: Path, metrics: Dict[str, Any]) -> Dict[s
         metrics.update(_operation_cost_metrics(df, env.p))
         metrics.update(_operation_physical_metrics(df, env.p))
     _write_json(out_dir / "metrics.json", metrics)
+    (out_dir / IN_PROGRESS_MARKER).unlink(missing_ok=True)
     return metrics
 
 
@@ -329,6 +364,9 @@ def _cached_metrics(
     run_config: dict,
 ) -> Optional[Dict[str, Any]]:
     """Metrics of a finished case, or None (missing or corrupt -> re-run)."""
+    if (Path(out_dir) / IN_PROGRESS_MARKER).exists():
+        print(f'[incomplete] {Path(out_dir).name}: previous run did not finish; re-running case')
+        return None
     path = Path(out_dir) / "metrics.json"
     if not path.exists():
         return None
@@ -341,19 +379,75 @@ def _cached_metrics(
         if cached_version != OPERATION_MODEL_VERSION and compatibility_reason is None:
             print(f'[stale] {Path(out_dir).name}: operation model changed; re-running case')
             return None
+        changed = False
         expected_params = parameter_fingerprint(params)
         if metrics.get("parameter_fingerprint_sha256") != expected_params:
-            print(f'[stale] {Path(out_dir).name}: parameters changed; re-running case')
-            return None
+            parameters_path = Path(out_dir) / "parameters_used.json"
+            try:
+                cached_params = json.loads(parameters_path.read_text(encoding="utf-8"))
+                cached_params.pop("_operation_model", None)
+                cached_params.pop("_operation_run", None)
+                portable_cache_match = (
+                    parameter_fingerprint(cached_params) == expected_params
+                )
+            except (OSError, json.JSONDecodeError):
+                portable_cache_match = False
+            if not portable_cache_match:
+                print(f'[stale] {Path(out_dir).name}: parameters changed; re-running case')
+                return None
+            metrics.update(
+                parameter_fingerprint_sha256=expected_params,
+                parameter_fingerprint_version=PARAMETER_FINGERPRINT_VERSION,
+            )
+            changed = True
         expected_run = _run_fingerprint(run_config)
+        if bool(run_config.get("close_evaluation_energy", False)):
+            solver_failures = int(metrics.get("n_solve_fail", 0) or 0)
+            if solver_failures:
+                print(
+                    f'[stale] {Path(out_dir).name}: cached terminal-closure run '
+                    f'has {solver_failures} solver failure(s); re-running case'
+                )
+                return None
+            closure_fields_valid = (
+                metrics.get("close_evaluation_energy") is True
+                and float(metrics.get("terminal_closure_lookahead_h", -1.0))
+                == float(run_config["terminal_closure_lookahead_h"])
+                and metrics.get("terminal_plan_committed_at") is not None
+                and metrics.get("evaluation_terminal_energy_residual_kwh")
+                is not None
+            )
+            if not closure_fields_valid:
+                print(
+                    f'[stale] {Path(out_dir).name}: terminal-closure metrics '
+                    'are missing; re-running case'
+                )
+                return None
         if metrics.get("run_fingerprint_sha256") != expected_run:
-            print(f'[stale] {Path(out_dir).name}: run configuration changed; re-running case')
-            return None
+            parameters_path = Path(out_dir) / "parameters_used.json"
+            try:
+                cached_payload = json.loads(
+                    parameters_path.read_text(encoding="utf-8")
+                )
+                cached_run = dict(cached_payload.get("_operation_run", {}) or {})
+                cached_run.pop("run_fingerprint_sha256", None)
+                compatible_run = (
+                    not bool(run_config.get("close_evaluation_energy", False))
+                    and parameters_path.stat().st_mtime_ns
+                    <= path.stat().st_mtime_ns
+                    and _run_fingerprint(cached_run) == expected_run
+                )
+            except (OSError, json.JSONDecodeError):
+                compatible_run = False
+            if not compatible_run:
+                print(f'[stale] {Path(out_dir).name}: run configuration changed; re-running case')
+                return None
+            metrics["run_fingerprint_sha256"] = expected_run
+            changed = True
         expected = params['sizing_case_applied']['source_sha256']
         if metrics.get('sizing_source_sha256') != expected:
             print(f'[stale] {Path(out_dir).name}: sizing provenance changed; re-running case')
             return None
-        changed = False
         try:
             operation_df = read_operation(out_dir)
             reconstructed = {
@@ -394,6 +488,8 @@ def simulate_stochastic(
     pv_csv: str = DEFAULT_PV_CSV,
     solver_opts: Optional[dict] = None,
     resolve_every_h: float = 24.0,
+    close_evaluation_energy: bool = False,
+    terminal_closure_lookahead_h: float = 48.0,
     resume: bool = True,
 ) -> Dict[str, Any]:
     """Receding stochastic plan: solve from the measured state, follow the
@@ -408,6 +504,8 @@ def simulate_stochastic(
         "load_csv": str(load_csv),
         "pv_csv": str(pv_csv),
         "resolve_every_h": float(resolve_every_h),
+        "close_evaluation_energy": bool(close_evaluation_energy),
+        "terminal_closure_lookahead_h": float(terminal_closure_lookahead_h),
         "solver_opts": opts,
     }
     if resume:
@@ -418,10 +516,16 @@ def simulate_stochastic(
     validate_time_mesh(params)
     out_dir = _prepare_case_dir(params, Path(out_dir), run_config)
     env = _make_env(params, load_csv, pv_csv, start_ts, n_iters, out_dir)
+    evaluation_initial_energy_kwh = float(env.E_meas)
+    evaluation_end_ts = pd.Timestamp(start_ts) + pd.Timedelta(
+        hours=float(n_iters) * float(env.dt_h)
+    )
     plans_dir = out_dir / "plans"
     plans_dir.mkdir(parents=True, exist_ok=True)
+    written_plan_names: set[str] = set()
 
     operation = OnGridStochasticOperation(params, relaxation=True)
+    base_horizon_h = int(params["time"]["horizon_hours"])
     n_solves = 0
     n_solve_fail = 0
     n_fallback_steps = 0
@@ -430,19 +534,58 @@ def simulate_stochastic(
     last_status, last_term = "none", "none"
     pbess_prev_kw = 0.0
     next_resolve = env.timestamp  # forces the initial solve
+    last_resolve_failed = False
+    terminal_plan_committed_at: str | None = None
 
     def _resolve(now: pd.Timestamp) -> None:
+        nonlocal operation
         nonlocal n_solves, n_solve_fail, solve_time_total, next_resolve
         nonlocal max_simultaneity_kw, last_status, last_term
+        nonlocal last_resolve_failed
+        nonlocal terminal_plan_committed_at
         try:
+            remaining_h = float(
+                (evaluation_end_ts - now).total_seconds() / 3600.0
+            )
+            enforce_evaluation_terminal = bool(
+                close_evaluation_energy
+                and remaining_h <= float(terminal_closure_lookahead_h) + 1e-9
+            )
+            planning_params = params
+            if enforce_evaluation_terminal:
+                # Once the evaluation boundary enters the closure look-ahead,
+                # keep it explicitly inside every subsequent optimization.
+                # This avoids waiting until the last 36 h, when restoring the
+                # initial inventory may already be physically impossible.
+                required_h = max(base_horizon_h, int(math.ceil(remaining_h)))
+                outage_h = int(params.get("EDS", {}).get("outage_duration_hours", 0))
+                dt2_min = int(params["time"]["timestep_2_min"])
+                while ((required_h - outage_h) * 60) % dt2_min:
+                    required_h += 1
+                if required_h != base_horizon_h:
+                    planning_params = copy.deepcopy(params)
+                    planning_params["time"]["horizon_hours"] = required_h
+            candidate_operation = OnGridStochasticOperation(
+                planning_params, relaxation=True
+            )
             t0 = time.perf_counter()
-            operation.build(
+            candidate_operation.build(
                 start_dt=now.to_pydatetime(),
                 forecasts=None,  # the stochastic model uses train clusters, not forecasts
                 E_hat_kwh=float(env.E_meas),
                 P_bess_hat_kw=pbess_prev_kw,
+                evaluation_end_dt=(
+                    evaluation_end_ts.to_pydatetime()
+                    if enforce_evaluation_terminal
+                    else None
+                ),
+                evaluation_terminal_energy_kwh=(
+                    evaluation_initial_energy_kwh
+                    if enforce_evaluation_terminal
+                    else None
+                ),
             )
-            results = operation.solve(tee=False, **opts)
+            results = candidate_operation.solve(tee=False, **opts)
             dt = time.perf_counter() - t0
             solve_time_total += dt
             n_solves += 1
@@ -452,21 +595,36 @@ def simulate_stochastic(
                 f"[stochastic] solve {n_solves} at {now}: status={last_status} "
                 f"term={last_term} time={dt:.1f}s"
             )
-            write_stochastic_plan(
-                operation.extract_full_solution(),
+            written_plan = write_stochastic_plan(
+                candidate_operation.extract_full_solution(),
                 plans_dir / f"plan_{now.strftime('%Y%m%dT%H%M')}.parquet",
             )
+            written_plan_names.add(written_plan.name)
             # relaxation exactness check: should stay at zero
             max_simultaneity_kw = max(
                 max_simultaneity_kw,
                 max(
-                    (min(a.get("P_ch_kw", 0.0), a.get("P_dis_kw", 0.0)) for a in operation._actions),
+                    (
+                        min(a.get("P_ch_kw", 0.0), a.get("P_dis_kw", 0.0))
+                        for a in candidate_operation._actions
+                    ),
                     default=0.0,
                 ),
             )
-            next_resolve = now + pd.Timedelta(hours=float(resolve_every_h))
+            operation = candidate_operation
+            last_resolve_failed = False
+            if enforce_evaluation_terminal:
+                # Commit the first feasible plan that reaches the finite
+                # evaluation boundary. Rebuilding the stochastic scenario set
+                # closer to the boundary is not recursively feasible in
+                # general, whereas the retained plan is feasible by construction.
+                terminal_plan_committed_at = now.isoformat()
+                next_resolve = evaluation_end_ts
+            else:
+                next_resolve = now + pd.Timedelta(hours=float(resolve_every_h))
         except Exception as e:
             n_solve_fail += 1
+            last_resolve_failed = True
             print(f"[stochastic] WARN: solve failed at {now}: {e}. Retrying in 1h.")
             next_resolve = now + pd.Timedelta(hours=1.0)
 
@@ -475,7 +633,10 @@ def simulate_stochastic(
         now = env.timestamp
 
         # Re-solve on schedule or when the plan window ran out; never while islanded.
-        if env.mode != "offgrid" and (now >= next_resolve or not operation.get_control_at(now)):
+        action_available = bool(operation.get_control_at(now))
+        if env.mode != "offgrid" and (
+            now >= next_resolve or (not action_available and not last_resolve_failed)
+        ):
             _resolve(now)
 
         action = operation.get_control_at(now)
@@ -505,6 +666,16 @@ def simulate_stochastic(
         "timestep_2_min": int(params["time"]["timestep_2_min"]),
         "n_iters": int(n_iters),
         "resolve_every_h": float(resolve_every_h),
+        "close_evaluation_energy": bool(close_evaluation_energy),
+        "terminal_closure_lookahead_h": float(terminal_closure_lookahead_h),
+        "terminal_plan_committed_at": terminal_plan_committed_at,
+        "evaluation_initial_energy_kwh": evaluation_initial_energy_kwh,
+        "evaluation_final_energy_kwh": float(env.E_meas),
+        "evaluation_terminal_energy_residual_kwh": (
+            abs(float(env.E_meas) - evaluation_initial_energy_kwh)
+            if close_evaluation_energy
+            else None
+        ),
         "n_solves": int(n_solves),
         "n_solve_fail": int(n_solve_fail),
         "n_fallback_steps": int(n_fallback_steps),
@@ -514,7 +685,24 @@ def simulate_stochastic(
         "run_start_ts": run_config["start_ts"],
         "run_fingerprint_sha256": _run_fingerprint(run_config),
     }
-    return _finish_case(env, out_dir, metrics)
+    completed_metrics = _finish_case(env, out_dir, metrics)
+    # Only after the replacement trajectory and metrics have been committed,
+    # remove plan files left by an older configuration. Interrupted reruns
+    # therefore never destroy the last complete artifact set.
+    for stale_plan in plans_dir.iterdir():
+        if (
+            stale_plan.is_file()
+            and stale_plan.name not in written_plan_names
+            and (
+                stale_plan.name.startswith("plan_")
+                or stale_plan.name.startswith(".plan_")
+            )
+        ):
+            try:
+                stale_plan.unlink()
+            except OSError as error:
+                print(f"[stochastic] WARN: could not remove stale plan {stale_plan}: {error}")
+    return completed_metrics
 
 
 def simulate_mpc(

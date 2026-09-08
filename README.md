@@ -223,7 +223,7 @@ it is therefore a reserve-only policy, not a system without storage.
 
 ### Experiments
 
-The repository has two explicit experiment entry points. Operation requires a
+The repository has three explicit experiment entry points. Operation requires a
 traceable sizing artifact, but the sizing optimization does not need to run on
 the operational machine.
 
@@ -231,11 +231,49 @@ the operational machine.
 |---|---|
 | [`1-sizing.py`](1-sizing.py) | 0%, 50%, and 100% outage-service sizing, with and without degradation |
 | [`2-operation.py`](2-operation.py) | causal, versioned, and resumable operation of the three degradation-aware sizing cases |
+| [`3-baselines.py`](3-baselines.py) | independent rule-based baselines with incremental pairing against available operation results |
 
 The operational pipeline writes resumable cases under
 `outputs/operation-sweep/with-degradation/<sizing-case>/` and continuously
 updates `summary.csv` and `pipeline_state.json`. Figures and tables are rebuilt from the summaries by
 `scripts/make_figures.py` and `scripts/make_tables.py`.
+
+Operational cache fingerprints retain the sizing and parameter content hashes
+but exclude machine-local source paths. Campaign artifacts can therefore be
+copied between workstations without triggering scientifically unnecessary
+recomputations. Summary and progress-file replacement is retried on transient
+Windows file locks. A per-case in-progress marker prevents an interrupted rerun
+from combining newly written parameters with an older metrics artifact.
+
+Run `python 3-baselines.py` as soon as the sizing artifacts are available. The
+script evaluates reserve-only, self-consumption, time-of-use load-shifting, and
+peak-shaving policies independently under `outputs/baseline-sweep/`. Available
+audited results from `2-operation.py` are paired by sizing fingerprint, month,
+and exogenous-trajectory hash. Partial comparisons use only common completed
+months; the definitive 120-day table is emitted after all references are ready.
+The comparison reports both realized cost and a finite-window inventory-adjusted
+cost. The latter credits or replaces the final BESS energy relative to its
+initial value at the mean available import tariff, including charging efficiency
+and marginal throughput wear; the raw cost and terminal energy delta remain in
+the same table for sensitivity checks.
+
+Paper-facing analyses are reproducible with:
+
+```powershell
+python scripts/rebuild_sizing_summaries.py
+python scripts/run_sizing_autonomy_sensitivity.py
+python scripts/analyze_paper_results.py
+```
+
+The first command reconstructs aggregate sizing summaries from the immutable
+per-case artifacts. The second evaluates 1, 2, 4, and 6 h outage-duration
+requirements for the 50% and 100% critical-load cases, with and without battery
+degradation. If the 6 h full-service case reaches the 25 kWh design ceiling, it
+automatically runs an expanded-bound minimum-capacity certificate and reports
+the point as capacity-limit infeasible. The third produces paired monthly controller statistics,
+robustness summaries, publication figures, and the machine-readable tables
+under `outputs/paper-analysis/`. All three scripts are resumable or derived from
+existing artifacts and do not overwrite operational trajectories.
 
 The corrected campaign uses a fixed physical outage support, hazard-based
 scenario weights, complete pre-outage non-anticipativity, a 5-min ramp
@@ -253,6 +291,18 @@ within the same model version, leaving 891 additional monthly runs. Superseded
 runs remain local under `.old/`; only audited scientific artifacts
 are promoted to `paper/`. Distributed campaigns use `outputs/sweeps/` and must
 pass the same audits before promotion.
+
+The recourse-frequency experiment additionally imposes exact equality between
+the initial battery energy and the energy at the finite 10-day evaluation
+boundary. The terminal boundary enters the stochastic optimization 48 hours
+before the end, and the first feasible terminal plan is then committed through
+the evaluation boundary. This avoids the lack of recursive feasibility caused
+by rebuilding a shifted robust scenario set in the last day. Boundaries inside
+a coarse action interval are represented by the corresponding partial energy
+transition. This prevents
+different residual battery inventories from being misinterpreted as
+operating-cost differences between re-optimization frequencies. Its terminal
+residual is recorded and audited at $10^{-6}$ kWh.
 
 Large trajectories and stochastic plans remain under ignored `outputs/` and
 are not committed to Git. Every operational output root stores copies of the

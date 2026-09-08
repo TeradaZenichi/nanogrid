@@ -1,0 +1,25 @@
+\begin{table*}[t]
+\centering
+\small
+\caption{Paired comparison against prototype-forecast MPC over twelve monthly windows.}
+\label{tab:controller-comparison}
+\begin{tabular}{llrrr}
+\toprule
+Case & Comparator & $\Delta C$ [\%] & 95\% CI [USD] & $p_{\rm Holm}$ \\
+\midrule
+Critical 50\% & Perfect forecast & -1.8 & [-0.27, -0.11] & 0.0029 \\
+ & LSTM & -1.8 & [-0.26, -0.15] & 0.0029 \\
+ & Reserve-only & +4.5 & [+0.39, +0.62] & 0.0029 \\
+ & Load shifting & +5.2 & [+0.48, +0.69] & 0.0029 \\
+ & Peak shaving & +31.4 & [+2.33, +5.37] & 0.0029 \\
+ & Self-consumption & +52.5 & [+4.26, +7.91] & 0.0029 \\
+Full 100\% & Perfect forecast & -1.7 & [-0.30, -0.05] & 0.0210 \\
+ & LSTM & -2.7 & [-0.43, -0.18] & 0.0029 \\
+ & Reserve-only & +4.9 & [+0.38, +0.66] & 0.0029 \\
+ & Load shifting & +4.6 & [+0.36, +0.62] & 0.0029 \\
+ & Peak shaving & +26.9 & [+2.16, +3.84] & 0.0029 \\
+ & Self-consumption & +60.1 & [+4.71, +8.52] & 0.0029 \\
+\bottomrule
+\end{tabular}
+\par\vspace{1mm}{\footnotesize Negative differences favor the comparator. Confidence intervals are paired bootstrap intervals ($20{,}000$ resamples).}
+\end{table*}

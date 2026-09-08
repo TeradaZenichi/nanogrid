@@ -41,7 +41,7 @@ DEFAULT_OUT_ROOT = OPERATION_ROOT
 DEFAULT_SMOKE_ROOT = ROOT / "outputs" / "_smoke-pipeline"
 DEFAULT_N_ITERS = 2880
 STAGE = "all"
-WORKERS = 4
+WORKERS = 2
 N_ITERS = DEFAULT_N_ITERS
 SMOKE_ITERS = 3
 TOP_K = 3
@@ -179,6 +179,16 @@ def _audit_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         if actual > tolerance:
             reasons.append(f"{label} {actual:.12g} {unit}")
 
+    terminal_residual = metrics.get("evaluation_terminal_energy_residual_kwh")
+    if (
+        terminal_residual is not None
+        and not pd.isna(terminal_residual)
+        and float(terminal_residual) > 1e-6
+    ):
+        reasons.append(
+            f"evaluation terminal-energy residual {float(terminal_residual):.12g} kWh"
+        )
+
     return {
         "audit_pass": not reasons,
         "audit_failures": len(reasons),
@@ -214,6 +224,10 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
             n_iters,
             out_dir,
             resolve_every_h=float(task.get("resolve_every_h", 24.0)),
+            close_evaluation_energy=bool(task.get("close_evaluation_energy", False)),
+            terminal_closure_lookahead_h=float(
+                task.get("terminal_closure_lookahead_h", 48.0)
+            ),
             resume=bool(task.get("resume", True)),
         )
         controller_name = "stochastic"
@@ -266,13 +280,24 @@ def _write_progress(
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
 
 
 def _write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     pd.DataFrame(rows).to_csv(temporary, index=False)
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
+
+
+def _replace_with_retry(temporary: Path, destination: Path) -> None:
+    for attempt in range(10):
+        try:
+            os.replace(temporary, destination)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _existing_summary_rows(path: Path, case_ids: set[str]) -> list[dict[str, Any]]:
@@ -772,6 +797,8 @@ def stage_recourse(args) -> pd.DataFrame:
                     labels={"window": window, "seed": seed, "resolve_every_h": frequency},
                     seed=seed,
                     resolve_every_h=frequency,
+                    close_evaluation_energy=True,
+                    terminal_closure_lookahead_h=48.0,
                     resume=not args.fresh,
                 )
             )
@@ -927,6 +954,7 @@ def write_manifest(args) -> None:
             "complete pre-outage non-anticipativity for BESS, grid, shedding, and curtailment",
             "5 min physical ramp reference independent of dt1",
             "terminal energy after the last interval not below measured initial energy",
+            "exact common terminal energy at the finite recourse evaluation boundary",
             "BESS wear charged on bidirectional throughput instead of absolute net power",
             "fixed export remuneration included in MPC, stochastic operation, and realized costs",
             "continuous realized load shedding consistent with the LP operational models",

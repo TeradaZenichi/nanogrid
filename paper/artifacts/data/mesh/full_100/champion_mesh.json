@@ -1,0 +1,40 @@
+{
+  "operation_model_version": "2026.09-evaluation-terminal-closure-v8",
+  "mesh_selection_version": "operational-forecaster-regret-annual-wear-v5",
+  "required_controllers": [
+    "prototype",
+    "lstm"
+  ],
+  "expected_runs_per_controller": 12,
+  "selection_rule": "Pareto front over mean forecaster regret, maximum forecaster regret, and mean solve time; score = 0.4 normalized mean regret + 0.4 normalized maximum regret + 0.2 normalized solve time",
+  "selection_weights": {
+    "mean_regret": 0.4,
+    "max_regret": 0.4,
+    "solve_time": 0.2
+  },
+  "selected": [
+    {
+      "combo": "h24_t1_5_t2_120",
+      "h": 24.0,
+      "t1": 5.0,
+      "t2": 120.0,
+      "mean_cost": 9.6523324978,
+      "mean_solve_time_s": 0.3383336907,
+      "mean_regret": 0.0083428979,
+      "max_regret": 0.0121805224,
+      "controllers": 2,
+      "runs": 24,
+      "cost_lstm": 9.6150439334,
+      "cost_prototype": 9.6896210621,
+      "solve_time_s_lstm": 0.3385788201,
+      "solve_time_s_prototype": 0.3380885613,
+      "regret_lstm": 0.0045052734,
+      "regret_prototype": 0.0121805224,
+      "mean_regret_norm": 0.0165010811,
+      "max_regret_norm": 0.0,
+      "time_norm": 0.2744981299,
+      "selection_score": 0.0615000584,
+      "pareto": true
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+\begin{table}[t]
+\centering
+\small
+\caption{Sensitivity of degradation-aware sizing to the outage-autonomy requirement.}
+\label{tab:autonomy}
+\begin{tabular}{lrrrr}
+\toprule
+Case & Autonomy [h] & PV [kW] & BESS [kWh] & Cost [USD] \\
+\midrule
+Critical 50\% & 1 & 2.20 & 6.29 & 14,525 \\
+ & 2 & 2.39 & 6.53 & 15,372 \\
+ & 4 & 2.63 & 7.97 & 17,126 \\
+ & 6 & 2.77 & 12.89 & 22,567 \\
+Full 100\% & 1 & 2.20 & 12.54 & 21,044 \\
+ & 2 & 2.57 & 13.01 & 22,504 \\
+ & 4 & 2.95 & 15.88 & 25,926 \\
+ & 6 & -- & $>25$ & infeasible \\
+\bottomrule
+\end{tabular}
+\par\vspace{1mm}{\footnotesize The 6-h full-service design is infeasible under the 25-kWh cap; an expanded-bound solve certified a minimum of 25.63 kWh.}
+\end{table}

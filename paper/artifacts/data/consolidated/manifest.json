@@ -1,0 +1,31 @@
+{
+  "analysis_version": "paper-analysis-v2",
+  "primary_controller_reference": "prototype",
+  "paired_months_per_comparison": 12,
+  "bootstrap_samples": 20000,
+  "bootstrap_seed": 20260908,
+  "paired_difference_definition": "comparator minus prototype MPC",
+  "wilcoxon_alternative": "two-sided",
+  "multiple_comparison_correction": "Holm within sizing case and metric",
+  "autonomy_sizing_points": 16,
+  "autonomy_feasible_points": 15,
+  "capacity_limit_certificate": {
+    "path": "sizing-autonomy/capacity_limit_diagnostic.json",
+    "case": "full_100",
+    "outage_duration_h": 6.0,
+    "original_cap_kwh": 25.0,
+    "minimum_feasible_kwh": 25.627637681883677
+  },
+  "outputs": [
+    "sizing_degradation_comparison.csv",
+    "controller_monthly_paired.csv",
+    "controller_paired_statistics.csv",
+    "robustness_summary.csv",
+    "sizing_autonomy_processed.csv",
+    "paper_result_summary.md",
+    "paired_controller_cost.png",
+    "paired_controller_cost.pdf",
+    "sizing_autonomy_sensitivity.png",
+    "sizing_autonomy_sensitivity.pdf"
+  ]
+}

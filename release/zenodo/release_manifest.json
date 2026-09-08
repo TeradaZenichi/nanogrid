@@ -1,0 +1,29 @@
+{
+  "generated_by": "scripts/build_publication_release.py",
+  "github_paper_bundle": {
+    "files": 29,
+    "size_bytes": 221978,
+    "path": "paper/artifacts"
+  },
+  "zenodo_tiers": {
+    "core": {
+      "files": 2119,
+      "size_bytes": 138850723,
+      "inventory": "release/zenodo/inventory_core.csv"
+    },
+    "full": {
+      "files": 18400,
+      "size_bytes": 1342805774,
+      "inventory": "release/zenodo/inventory_full.csv"
+    }
+  },
+  "selection_policy": {
+    "core": "champion operation, baselines, critical/full robustness, mesh summaries, sizing and paper data",
+    "full": "complete audited operation and baseline trees plus sizing and paper data",
+    "excluded": [
+      "temporary files",
+      ".pipeline_state temporary files",
+      "Python caches"
+    ]
+  }
+}

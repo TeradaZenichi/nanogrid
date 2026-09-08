@@ -56,14 +56,64 @@
   },
   "selected_cases": [
     {
+      "case_id": "economic",
+      "label": "Economic sizing",
+      "service_fraction": 0.0,
+      "pv_credit_mode": "none"
+    },
+    {
+      "case_id": "critical_50",
+      "label": "Critical-load resilience",
+      "service_fraction": 0.5,
+      "pv_credit_mode": "none"
+    },
+    {
       "case_id": "full_100",
       "label": "Full-load resilience",
       "service_fraction": 1.0,
       "pv_credit_mode": "none"
     }
   ],
-  "updated_at_utc": "2026-08-21T00:11:25.207138+00:00",
+  "updated_at_utc": "2026-09-08T14:40:26.912948+00:00",
   "cases": [
+    {
+      "case_id": "economic",
+      "minimum_service_fraction": 0.0,
+      "pv_size_kw": 2.1447135618578193,
+      "bess_size_kwh": 8.170782593836883e-11,
+      "bess_power_kw": 3.268313037534754e-11,
+      "capex_usd": 3431.5416990577323,
+      "npv_opex_usd": 5611.3065527022845,
+      "objective_usd": 9042.848251760017,
+      "expected_shed_kwh_day_y1": 0.06263495549133724,
+      "conditional_outage_shed_kwh_y1": 0.6263495549132743,
+      "minimum_service_fraction_last_year": 2.19824158875781e-14,
+      "test_power_margin_kw_last_year": 1.3934271070880095,
+      "test_energy_margin_kwh_last_year": 2.750568916807236,
+      "test_tail_pass_last_year": true,
+      "runtime_seconds": 478.53106149996165,
+      "solver_status": "ok",
+      "termination_condition": "optimal"
+    },
+    {
+      "case_id": "critical_50",
+      "minimum_service_fraction": 0.5,
+      "pv_size_kw": 2.68450778297775,
+      "bess_size_kwh": 6.250000000008468,
+      "bess_power_kw": 2.5000000000033875,
+      "capex_usd": 10813.962452773232,
+      "npv_opex_usd": 3899.254172522669,
+      "objective_usd": 14713.216625295901,
+      "expected_shed_kwh_day_y1": 0.006647760890392599,
+      "conditional_outage_shed_kwh_y1": 0.06647760890227908,
+      "minimum_service_fraction_last_year": 0.5000000000004388,
+      "test_power_margin_kw_last_year": 1.7441331003050937,
+      "test_energy_margin_kwh_last_year": 6.04818557289658,
+      "test_tail_pass_last_year": true,
+      "runtime_seconds": 217.35850289999507,
+      "solver_status": "ok",
+      "termination_condition": "optimal"
+    },
     {
       "case_id": "full_100",
       "minimum_service_fraction": 1.0,

@@ -1,0 +1,40 @@
+{
+  "operation_model_version": "2026.08-export-revenue-v7",
+  "mesh_selection_version": "operational-forecaster-regret-annual-wear-v5",
+  "required_controllers": [
+    "prototype",
+    "lstm"
+  ],
+  "expected_runs_per_controller": 12,
+  "selection_rule": "Pareto front over mean forecaster regret, maximum forecaster regret, and mean solve time; score = 0.4 normalized mean regret + 0.4 normalized maximum regret + 0.2 normalized solve time",
+  "selection_weights": {
+    "mean_regret": 0.4,
+    "max_regret": 0.4,
+    "solve_time": 0.2
+  },
+  "selected": [
+    {
+      "combo": "h24_t1_5_t2_120",
+      "h": 24.0,
+      "t1": 5.0,
+      "t2": 120.0,
+      "mean_cost": 10.8504544845,
+      "mean_solve_time_s": 0.5389847619,
+      "mean_regret": 0.0052604922,
+      "max_regret": 0.0081599902,
+      "controllers": 2,
+      "runs": 24,
+      "cost_lstm": 10.7949624479,
+      "cost_prototype": 10.9059465211,
+      "solve_time_s_lstm": 0.5375319018,
+      "solve_time_s_prototype": 0.5404376221,
+      "regret_lstm": 0.0023609942,
+      "regret_prototype": 0.0081599902,
+      "mean_regret_norm": 0.0801722337,
+      "max_regret_norm": 0.0988994035,
+      "time_norm": 0.2441105209,
+      "selection_score": 0.1204507591,
+      "pareto": true
+    }
+  ]
+}

@@ -405,9 +405,17 @@ def _run_case(
     result_path = case_dir / "sizing_decision_variables.json"
     if result_path.exists() and not args.force:
         existing = json.loads(result_path.read_text(encoding="utf-8"))
-        if existing.get("effective_config_sha256") == effective_hash:
+        resumable = (
+            existing.get("effective_config_sha256") == effective_hash
+            and bool(existing.get("has_loaded_solution", False))
+            and str(existing.get("solver_status", "")).lower() == "ok"
+            and str(existing.get("termination_condition", "")).lower()
+            in {"optimal", "locallyoptimal", "feasible"}
+        )
+        if resumable:
             print(f"{case.case_id}: resumed")
             return existing
+        print(f"{case.case_id}: cached result is not reusable; solving again")
 
     started = time.perf_counter()
     result: dict[str, Any] = {
@@ -549,7 +557,13 @@ def _save_outputs(root: Path, results: list[dict[str, Any]], campaign: dict[str,
     family = _configure_gulliver()
     report = root / "sizing_resilience_report.pdf"
     labels = [result["case_label"] for result in solved]
-    with PdfPages(report, metadata={"Title": "Resilience sizing comparison", "Font": family}) as pdf:
+    with PdfPages(
+        report,
+        metadata={
+            "Title": "Resilience sizing comparison",
+            "Creator": f"1-sizing.py ({family})",
+        },
+    ) as pdf:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
         axes[0].bar(labels, [r["decision_variables"]["P_hat_PV_kw"] for r in solved], color="#E4A11B")
         axes[0].set_ylabel("PV capacity (kW)", fontsize=9)

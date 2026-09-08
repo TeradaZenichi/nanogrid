@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\small
+\caption{Decomposition of the mean LSTM-minus-perfect-forecast cost difference.}
+\label{tab:forecast-decomposition}
+\begin{tabular}{lrrrrr}
+\toprule
+Case & Raw & Wear & Terminal & Adjusted & $\Delta E_T$ \\
+ & [USD] & [USD] & [USD] & [USD] & [kWh] \\
+\midrule
+Critical 50\% & +0.121 & -0.428 & -0.127 & -0.005 & +0.464 \\
+Full 100\% & +0.116 & -0.442 & -0.223 & -0.107 & +0.819 \\
+\bottomrule
+\end{tabular}
+\par\vspace{1mm}{\footnotesize Negative values favor LSTM. Wear is a component of raw cost; terminal adjustment is applied ex post. $\Delta E_T$ is the LSTM-minus-perfect terminal-energy difference.}
+\end{table}

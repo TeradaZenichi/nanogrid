@@ -1,0 +1,180 @@
+{
+  "bundle": "github-paper-artifacts",
+  "generated_by": "scripts/build_publication_release.py",
+  "files": [
+    {
+      "path": "figures/fig_autonomy_sensitivity.pdf",
+      "source": "outputs/paper-analysis/paper-assets/figures/fig_autonomy_sensitivity.pdf",
+      "size_bytes": 12089,
+      "sha256": "59b5e025c0c14de17b1c856845682bd6d7d4c696878b3647d33dbc6e25fcd0a8"
+    },
+    {
+      "path": "figures/fig_bess_noise_robustness.pdf",
+      "source": "outputs/paper-analysis/paper-assets/figures/fig_bess_noise_robustness.pdf",
+      "size_bytes": 8173,
+      "sha256": "858a7f5aa60b50f539ca638a9bd6c6f36a13bbc2b3a0bf16c7cf37d5c8e3405e"
+    },
+    {
+      "path": "figures/fig_controller_comparison.pdf",
+      "source": "outputs/paper-analysis/paper-assets/figures/fig_controller_comparison.pdf",
+      "size_bytes": 10776,
+      "sha256": "950e673390fac25e105680d651c0c5ef7b16bfca24e138b4c12ce8773d1f1a94"
+    },
+    {
+      "path": "figures/fig_lstm_ideal_decomposition.pdf",
+      "source": "outputs/paper-analysis/paper-assets/figures/fig_lstm_ideal_decomposition.pdf",
+      "size_bytes": 9069,
+      "sha256": "2e4bb8d50c399e8a3315364e62f0307ed213f7ef7257fd0124ab61e14b1ab6ab"
+    },
+    {
+      "path": "figures/fig_mesh_tradeoff.pdf",
+      "source": "outputs/paper-analysis/paper-assets/figures/fig_mesh_tradeoff.pdf",
+      "size_bytes": 11869,
+      "sha256": "218f0eee64a294693e514fef5b41792f8861e6a22e151158900dc2946600a815"
+    },
+    {
+      "path": "figures/fig_sizing_degradation.pdf",
+      "source": "outputs/paper-analysis/paper-assets/figures/fig_sizing_degradation.pdf",
+      "size_bytes": 8873,
+      "sha256": "3843319d37e5398c162cc3cbf92eb52a9d5763fb8150339b341ce00e565350bc"
+    },
+    {
+      "path": "tables/tab_autonomy.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tab_autonomy.tex",
+      "size_bytes": 733,
+      "sha256": "bc3630725739d3cc3e4e798d2995789b4504beffbba842aae5b7b836697c31ba"
+    },
+    {
+      "path": "tables/tab_controller_comparison.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tab_controller_comparison.tex",
+      "size_bytes": 1139,
+      "sha256": "378384d2ebe0d6ebfb06fe346e4c7f82cbf015edf5b4a9d40e2ed5ac5c523f7c"
+    },
+    {
+      "path": "tables/tab_forecast_decomposition.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tab_forecast_decomposition.tex",
+      "size_bytes": 670,
+      "sha256": "4df3a74c5193aff69a32c176aa4b8e0b4a6fe1e7da5258944992a0447a855a14"
+    },
+    {
+      "path": "tables/tab_mesh.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tab_mesh.tex",
+      "size_bytes": 601,
+      "sha256": "880b8308824040c039852f1d02afd027dc07ab7498a82c63101a8662d7ea3ffe"
+    },
+    {
+      "path": "tables/tab_robustness.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tab_robustness.tex",
+      "size_bytes": 527,
+      "sha256": "76acf7bf7008bee2aa29d8609bb67ad2f90ab69bf220a997dc988644270e47e6"
+    },
+    {
+      "path": "tables/tab_sizing.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tab_sizing.tex",
+      "size_bytes": 528,
+      "sha256": "72954a7786899c57a9234c86ed571472fa95948870e375ab82ad0918d225112c"
+    },
+    {
+      "path": "tables/tables_all.tex",
+      "source": "outputs/paper-analysis/paper-assets/tables/tables_all.tex",
+      "size_bytes": 4303,
+      "sha256": "e7ec56ac8227c2c0df03111b09f46c55b64a2b49ad91f171d3f28c29413db5af"
+    },
+    {
+      "path": "data/consolidated/sizing_degradation_comparison.csv",
+      "source": "outputs/paper-analysis/sizing_degradation_comparison.csv",
+      "size_bytes": 2147,
+      "sha256": "19e0111ca181ebc033bb4c4f1a883c3853d8716f1d3ec3d2071d147bd0c45326"
+    },
+    {
+      "path": "data/consolidated/sizing_autonomy_processed.csv",
+      "source": "outputs/paper-analysis/sizing_autonomy_processed.csv",
+      "size_bytes": 5552,
+      "sha256": "89ef990d8f91c2020f58eb751290a12c394758ae7147f54e9dd70aa75f3214be"
+    },
+    {
+      "path": "data/consolidated/controller_monthly_paired.csv",
+      "source": "outputs/paper-analysis/controller_monthly_paired.csv",
+      "size_bytes": 69994,
+      "sha256": "0a2531c1cc5ccfb7e40385ef02ffe7bba6c31ac666f72dead4b1e0f06c2815ab"
+    },
+    {
+      "path": "data/consolidated/controller_paired_statistics.csv",
+      "source": "outputs/paper-analysis/controller_paired_statistics.csv",
+      "size_bytes": 21461,
+      "sha256": "aeec914d30a07496819d4dfe3c3ee6fee7736e575e627972779bb9e3ec303f8a"
+    },
+    {
+      "path": "data/consolidated/robustness_summary.csv",
+      "source": "outputs/paper-analysis/robustness_summary.csv",
+      "size_bytes": 13988,
+      "sha256": "127cfc9e57291fbd13f81b1503dd433f239b6f010fc770b0ba5419af56cc11dd"
+    },
+    {
+      "path": "data/consolidated/paper_result_summary.md",
+      "source": "outputs/paper-analysis/paper_result_summary.md",
+      "size_bytes": 3282,
+      "sha256": "c3a24bccc60632d8cdc40af8615bffe04e9f4db44f8de53ede62183da89baa65"
+    },
+    {
+      "path": "data/consolidated/manifest.json",
+      "source": "outputs/paper-analysis/manifest.json",
+      "size_bytes": 1080,
+      "sha256": "c888eaf138890d88fd503ba00b2f2f781ec229b2d157663e46806816735c7ab5"
+    },
+    {
+      "path": "data/mesh/economic/champion_mesh.csv",
+      "source": "outputs/operation-sweep/with-degradation/economic/02-seasonal-mesh/champion_mesh.csv",
+      "size_bytes": 7705,
+      "sha256": "8f1fbad52e154e567b646d5ce2cd1fa3ebedc4f9980ef04b08154bfd2d844436"
+    },
+    {
+      "path": "data/mesh/economic/champion_mesh.json",
+      "source": "outputs/operation-sweep/with-degradation/economic/02-seasonal-mesh/champion_mesh.json",
+      "size_bytes": 1239,
+      "sha256": "4dcb6330b28017a2303bfaa519720aadf6876b34256fec26b14b9bd7a28205bb"
+    },
+    {
+      "path": "data/mesh/economic/factor_effects.csv",
+      "source": "outputs/operation-sweep/with-degradation/economic/02-seasonal-mesh/factor_effects.csv",
+      "size_bytes": 2123,
+      "sha256": "410edeab81ac8605e89c4c8241f804c03f7c48beec03bd243272d7b8b72af161"
+    },
+    {
+      "path": "data/mesh/critical_50/champion_mesh.csv",
+      "source": "outputs/operation-sweep/with-degradation/critical_50/02-seasonal-mesh/champion_mesh.csv",
+      "size_bytes": 8654,
+      "sha256": "8fc48cfd27616ab737b44a3d08bd0d03f1622bd6eb3aeec6febae060272e7566"
+    },
+    {
+      "path": "data/mesh/critical_50/champion_mesh.json",
+      "source": "outputs/operation-sweep/with-degradation/critical_50/02-seasonal-mesh/champion_mesh.json",
+      "size_bytes": 1294,
+      "sha256": "edb9907955f579aeecee5b41a8f1e5427236efe714ce3e978656c674b550491e"
+    },
+    {
+      "path": "data/mesh/critical_50/factor_effects.csv",
+      "source": "outputs/operation-sweep/with-degradation/critical_50/02-seasonal-mesh/factor_effects.csv",
+      "size_bytes": 2111,
+      "sha256": "38bacd7c7976c3c732d88668306fa0f83ad97365ff14d2da2164525d62377d30"
+    },
+    {
+      "path": "data/mesh/full_100/champion_mesh.csv",
+      "source": "outputs/operation-sweep/with-degradation/full_100/02-seasonal-mesh/champion_mesh.csv",
+      "size_bytes": 8604,
+      "sha256": "44bed465e97fbbceb23d2a806d6069eeae5e7229a8907d7662d3f0bc007d8343"
+    },
+    {
+      "path": "data/mesh/full_100/champion_mesh.json",
+      "source": "outputs/operation-sweep/with-degradation/full_100/02-seasonal-mesh/champion_mesh.json",
+      "size_bytes": 1295,
+      "sha256": "8436d168dea5a86a05713119487ef51b79578f893c77f9aa0ec3beaa3e92202c"
+    },
+    {
+      "path": "data/mesh/full_100/factor_effects.csv",
+      "source": "outputs/operation-sweep/with-degradation/full_100/02-seasonal-mesh/factor_effects.csv",
+      "size_bytes": 2099,
+      "sha256": "c280a1043f9a84fa4553f863f6d20cbd12c9ef24bf5425e779042af385bbefd1"
+    }
+  ]
+}

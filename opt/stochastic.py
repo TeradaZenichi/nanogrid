@@ -361,6 +361,8 @@ class OnGridStochasticOperation:
         forecasts: Dict[str, Dict[datetime, float]] | None = None,
         E_hat_kwh: float = 0.0,
         P_bess_hat_kw: float = 0.0,
+        evaluation_end_dt: datetime | None = None,
+        evaluation_terminal_energy_kwh: float | None = None,
     ):
         _ = forecasts
 
@@ -484,9 +486,61 @@ class OnGridStochasticOperation:
         )
         m.E_hat = Param(initialize=float(E_hat_kwh))
         m.InitialCond = Constraint(rule=lambda _m: _m.E[first_t] == _m.E_hat)
-        if self.param.data["terminal_energy_policy"] == "initial":
+        if (evaluation_end_dt is None) != (evaluation_terminal_energy_kwh is None):
+            raise ValueError(
+                "evaluation_end_dt and evaluation_terminal_energy_kwh must be provided together"
+            )
+        if evaluation_end_dt is not None:
+            evaluation_end_dt = pd.Timestamp(evaluation_end_dt).to_pydatetime()
+            m.E_evaluation_terminal = Param(
+                initialize=float(evaluation_terminal_energy_kwh)
+            )
+
+            # E[t] is the energy at the beginning of action interval t.  The
+            # evaluation boundary may be a mesh point, the end of the modeled
+            # horizon, or fall inside a coarse action interval after a retry at
+            # an offset such as 00:05.  Expressing the boundary state through
+            # the containing interval handles all three cases exactly.
+            if evaluation_end_dt in self._times:
+                evaluation_energy = m.E[evaluation_end_dt]
+            else:
+                containing_t = next(
+                    (
+                        t
+                        for t in self._times
+                        if t < evaluation_end_dt
+                        <= t + timedelta(hours=float(tdata["dt_h_map"][t]))
+                    ),
+                    None,
+                )
+                if containing_t is None:
+                    modeled_end = self._times[-1] + timedelta(
+                        hours=float(tdata["dt_h_map"][self._times[-1]])
+                    )
+                    raise ValueError(
+                        "evaluation_end_dt is outside the modeled horizon: "
+                        f"{evaluation_end_dt.isoformat()} not in "
+                        f"[{self._times[0].isoformat()}, {modeled_end.isoformat()}]"
+                    )
+                partial_dt_h = (
+                    evaluation_end_dt - containing_t
+                ).total_seconds() / 3600.0
+                evaluation_energy = m.E[containing_t] + partial_dt_h * (
+                    m.eta_c * m.P_ch[containing_t]
+                    - m.P_dis[containing_t] / m.eta_d
+                )
+            m.EvaluationTerminalEnergy = Constraint(
+                expr=evaluation_energy == m.E_evaluation_terminal
+            )
+        if (
+            evaluation_end_dt is None
+            and self.param.data["terminal_energy_policy"] == "initial"
+        ):
             last_t = self._times[-1]
             # Include the last action because E[last_t] is pre-interval energy.
+            # When an exact finite-evaluation target is supplied above, it is
+            # the terminal policy for this solve. Keeping this generic target
+            # as well can be contradictory when E_hat exceeds that target.
             m.TerminalEnergy = Constraint(
                 expr=m.E[last_t]
                 + m.dt_h[last_t]

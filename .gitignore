@@ -17,6 +17,10 @@ predictions/
 PV Profiles/
 .old/
 
-# Compact solved sizing artifacts under operation-campaigns/ are intentional
-# repository inputs and must remain versionable across clones and commits.
-paper/
+# Compact solved artifacts under outputs/sizing-sweep are intentional repository
+# inputs and remain versionable across clones and commits.
+# Paper sources and compact publication artifacts are intentionally versioned.
+
+# Zenodo archives are built locally from versioned release manifests.  Keep the
+# manifests and documentation, but never commit the large generated packages.
+/release/zenodo/packages/

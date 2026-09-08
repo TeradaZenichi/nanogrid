@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\small
+\caption{Selected nonuniform MPC meshes from the annual two-forecaster campaign.}
+\label{tab:mesh}
+\begin{tabular}{lrrrrr}
+\toprule
+Case & $H/t_1/t_2$ & Mean & Max. & Solve & Score \\
+ & [h/min/min] & [\%] & [\%] & [s] & \\
+\midrule
+Critical 50\% & 24/5/120 & 0.526 & 0.816 & 0.539 & 0.1205 \\
+Full 100\% & 24/5/120 & 0.834 & 1.218 & 0.338 & 0.0615 \\
+\bottomrule
+\end{tabular}
+\par\vspace{1mm}{\footnotesize Regrets use each forecaster's own minimum-cost mesh. The score is $0.4z(\bar r)+0.4z(r_{\max})+0.2z(T)$ after Pareto filtering.}
+\end{table}

@@ -42,6 +42,7 @@ PLAIN_LOG_TICKS = FuncFormatter(lambda value, _: f"{value:g}")
 
 
 def _save(fig, name: str) -> None:
+    fig.tight_layout(pad=0.45)
     for text in fig.findobj(matplotlib.text.Text):
         text.set_text(text.get_text().replace("\N{MINUS SIGN}", "-"))
     for ext in ("pdf", "png"):
