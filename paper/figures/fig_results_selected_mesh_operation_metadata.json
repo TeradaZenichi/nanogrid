@@ -1,0 +1,33 @@
+{
+  "case": "critical_50",
+  "month": "2009-10",
+  "date": "2009-10-07",
+  "parquet_source": "outputs/operation-sweep/with-degradation/critical_50/03-forecast-operation/2009-10/prototype/operation_final.parquet",
+  "mesh": {
+    "horizon_h": 24,
+    "fine_min": 5,
+    "coarse_min": 120,
+    "fine_region_h": 2.0,
+    "intervals": 35
+  },
+  "outage_interval": [
+    {
+      "start": "2009-10-07 10:05:00",
+      "end_exclusive": "2009-10-07 11:50:00"
+    }
+  ],
+  "summary_statistics": {
+    "daily_load_kwh": 14.790508875248833,
+    "daily_pv_kwh": 12.220474362512618,
+    "bess_throughput_kwh": 5.915089120452908,
+    "soc_min_pct": 35.67545297099425,
+    "soc_max_pct": 82.27541929791659
+  },
+  "selection_score": 0.8040694578575492,
+  "eligible_days": 13,
+  "selection_rule": "Critical preferred; equal-weight maximum-normalized outage hours, SoC range, throughput and PV energy; date/path tie break",
+  "soc_timestamp_convention": "Post-step SoC, stored at step timestamp; plotted without shifting",
+  "grid_sign": "import minus export; positive import",
+  "bess_sign": "realized discharge minus charge; positive discharge",
+  "rejected_incomplete_days": []
+}
